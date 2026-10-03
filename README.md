@@ -10,6 +10,8 @@ A really simple standalone telnet daemon for classic AmigaOS.
 
 ## Run
 
+First run: foreground, from a Shell, so you can watch the log lines:
+
 ```amigados
 1> stack 20000
 1> telnetd            ; port 23
@@ -18,14 +20,40 @@ A really simple standalone telnet daemon for classic AmigaOS.
 
 Then from any machine on the LAN: `telnet <amiga-ip>` and you get an
 AmigaDOS shell. `EndCLI` (or `exit`) closes the session; the daemon waits
-for the next connection. Ctrl-C in the starting Shell stops the daemon.
+for the next connection. Ctrl-C in the starting Shell stops the daemon
+(between sessions; during a session, close the telnet client first).
 
-For startup at boot, add to `S:user-startup` (after the TCP/IP stack starts):
+### Do I need `stack 20000`?
+
+Recommended, belt-and-braces. The daemon's large buffers are static (not on
+the stack) and the shell it spawns gets an explicit 64 KB stack of its own,
+so the default 4 KB CLI stack will most likely work — but bsdsocket and DOS
+packet internals on a 68000 are exactly where a snug stack bites, and the
+one-line insurance is free. Set it once in the Shell (or in User-Startup
+before `run`) and forget about it.
+
+### Running in the background
+
+```amigados
+1> run >NIL: C:telnetd
+```
+
+With no console there is nothing to Ctrl-C, so stop it from any Shell:
+
+```amigados
+1> Status            ; find the process "Loaded as command: telnetd"
+1> Break <n> C       ; n = its process number
+```
+
+### Starting at boot
+
+Add to `S:User-Startup` — **after** the line(s) that bring up the TCP/IP
+stack (AmiTCP / AmiTCP_NG / Roadshow), or the daemon exits with
+"no bsdsocket.library":
 
 ```amigados
 if exists C:telnetd
-  stack 20000
-  run NIL: C:telnetd
+  run >NIL: C:telnetd
 endif
 ```
 
