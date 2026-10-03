@@ -40,9 +40,11 @@
 #include <dos/dos.h>
 #include <dos/dosextens.h>
 #include <dos/rdargs.h>
+#include <dos/dostags.h>
 
 #include <proto/exec.h>
 #include <proto/dos.h>
+#include <proto/alib.h>
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -61,7 +63,7 @@
 #define ACT_END      1007
 #define ERR_UNKNOWN  503    /* ERROR_ACTION_NOT_KNOWN */
 
-static struct Library *SocketBase = NULL;
+struct Library *SocketBase = NULL;
 static struct MsgPort *hdlPort   = NULL;
 static int              gListen   = -1;
 static int              gSock     = -1;
@@ -109,7 +111,7 @@ static LONG send_all(int s, const unsigned char *p, LONG n)
 {
     LONG sent = 0;
     while (sent < n) {
-        LONG k = send(s, (const char *)p + sent, (int)(n - sent), 0);
+        LONG k = send(s, (APTR)(p + sent), (int)(n - sent), 0);
         if (k <= 0) return -1;
         sent += k;
     }
@@ -209,7 +211,7 @@ int main(int argc, char **argv)
     sa.sin_addr.s_addr = htonl(INADDR_ANY);
     sa.sin_port        = htons((UWORD)port);
 
-    setsockopt(gListen, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof one);
+    setsockopt(gListen, SOL_SOCKET, SO_REUSEADDR, (APTR)&one, sizeof one);
     if (bind(gListen, (struct sockaddr *)&sa, sizeof sa) < 0) {
         PutStr((STRPTR)"telnetd: bind failed (port in use?)\n");
         goto out;
