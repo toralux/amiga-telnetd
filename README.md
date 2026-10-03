@@ -76,6 +76,8 @@ make
 
 GitHub Actions builds the binary on every push (see .github/workflows).
 
+**Prebuilt binaries:** [Releases](https://github.com/toralux/amiga-telnetd/releases) — every `v*` tag builds and publishes automatically. The tag must match the $VER cookie in the source (bump the verstag first), and -suffix tags such as `v0.1-pre1` are published as pre-releases.
+
 ## How it works
 
 For each accepted connection the daemon builds a DOS filehandle whose
