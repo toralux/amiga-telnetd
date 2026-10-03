@@ -183,6 +183,8 @@ int main(int argc, char **argv)
     BPTR fhB = 0;
     ULONG port = 23;
     int one = 1;
+    struct Process *self = (struct Process *)FindTask(NULL);
+    APTR oldwinptr = self->pr_WindowPtr;
 
     (void)argc; (void)argv;
 
@@ -199,6 +201,12 @@ int main(int argc, char **argv)
         FreeArgs(rd);
         return RETURN_FAIL;
     }
+
+    /* Daemon hygiene (pattern from amiagent): a client-run command naming an
+     * unmounted volume must never pop a DOS requester — nobody is at the
+     * machine to click Cancel, and the daemon would park. -1 fails instead.
+     * The SystemTags child inherits this. Restored on the way out. */
+    self->pr_WindowPtr = (APTR)-1;
 
     hdlPort = CreatePort((STRPTR)"telnetd.handler", 0);
     if (!hdlPort) { PutStr((STRPTR)"telnetd: no port\n"); goto out; }
@@ -251,6 +259,7 @@ int main(int argc, char **argv)
                        SYS_Output,  fhB,
                        SYS_Asynch,  TRUE,
                        SYS_UserShell, TRUE,
+                       NP_StackSize, 65536,
                        TAG_DONE) == -1) {
             PutStr((STRPTR)"telnetd: could not start shell\n");
             Close(fhB);
@@ -266,6 +275,7 @@ out:
     if (gListen >= 0) CloseSocket(gListen);
     if (hdlPort) DeletePort(hdlPort);
     if (SocketBase) CloseLibrary(SocketBase);
+    self->pr_WindowPtr = oldwinptr;
     FreeArgs(rd);
     return RETURN_OK;
 }
