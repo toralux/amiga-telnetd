@@ -11,10 +11,11 @@
  * shell exits (EndCLI), the handle is closed, the socket shuts down, and
  * the daemon accepts the next connection.
  *
- * Telnet option negotiation is not implemented: IAC sequences are
- * filtered on input, and typed characters are echoed by the daemon. If
- * your client line-edits oddly, switch it to character mode
- * (Ctrl-] then "mode character" in the BSD telnet client).
+ * Minimal telnet negotiation: on connect the daemon requests character
+ * mode with server echo (WILL ECHO, WILL SGA, DONT LINEMODE) and refuses
+ * every other option, so stock clients work without manual toggling.
+ * Output is translated to NVT CRLF. Ctrl-C works during a session too:
+ * it closes the connection, the shell exits cleanly, and the daemon stops.
  *
  * Build (cross toolchain on x64 Linux):
  *   m68k-amigaos-gcc -Os -m68000 -Wall -o telnetd telnetd.c -s
@@ -57,6 +58,19 @@
 #define MKBADDR(x) ((BPTR)(((ULONG)(x)) >> 2))
 #endif
 
+static const char __attribute__((used)) verstag[] =
+    "$VER: telnetd 0.1 (3.10.2026)";
+
+/* Telnet protocol bytes we care about (minimal NVT negotiation) */
+#define TEL_IAC      255
+#define TEL_DONT     254
+#define TEL_DO       253
+#define TEL_WONT     252
+#define TEL_WILL     251
+#define OPT_ECHO       1
+#define OPT_SGA        3
+#define OPT_LINEMODE  34
+
 #define IOBUF        2048
 #define ACT_READ     82     /* 'R' */
 #define ACT_WRITE    87     /* 'W' */
@@ -68,6 +82,7 @@ static struct MsgPort *hdlPort   = NULL;
 static int              gListen   = -1;
 static int              gSock     = -1;
 static BOOL             gDone     = FALSE;
+static BOOL             gBreak    = FALSE;
 
 /* Hand-built DOS FileHandle image: fh_Type = our port, fh_Arg1 = socket */
 struct MiniFH {
@@ -78,17 +93,30 @@ struct MiniFH {
     ULONG fh_Arg1;
 };
 
+static void send_iac(int cmd, int opt);
+
 /* Filter telnet IAC sequences; map CR and CRLF to LF. Returns kept bytes. */
 static LONG filter_input(unsigned char *buf, LONG n)
 {
-    LONG i, w = 0, state = 0, esc = 0;
+    LONG i, w = 0, state = 0, esc = 0, cmd = 0;
     for (i = 0; i < n; i++) {
         unsigned char ch = buf[i];
         if (state == 1) {                    /* IAC command byte */
             if (ch == 250) state = 2;        /* SB ... find SE */
             else if (ch == 255) { state = 0; buf[w++] = ch; }
+            else if (ch >= 251) { cmd = ch; state = 3; }
             else state = 0;
             continue;
+        }
+        if (state == 3) {                    /* option byte of a negotiation */
+            state = 0;
+            if (cmd == TEL_DO && (ch == OPT_ECHO || ch == OPT_SGA))
+                send_iac(TEL_WILL, ch);      /* keep the two we asked for */
+            else if (cmd == TEL_DO)
+                send_iac(TEL_WONT, ch);      /* refuse everything else */
+            else if (cmd == TEL_WILL)
+                send_iac(TEL_DONT, ch);      /* and want nothing back */
+            continue;                        /* DONT/WONT: silence is fine */
         }
         if (state == 2) {                    /* inside SB */
             if (ch == 240) state = 0;        /* SE */
@@ -118,6 +146,22 @@ static LONG send_all(int s, const unsigned char *p, LONG n)
     return sent;
 }
 
+/* Send one 3-byte telnet command. */
+static void send_iac(int cmd, int opt)
+{
+    unsigned char seq[3] = { TEL_IAC, cmd, opt };
+    send_all(gSock, seq, 3);
+}
+
+/* Kick the client into character mode with server echo: this is what makes
+ * stock telnet clients usable without manual "mode character" toggling. */
+static void negotiate_start(void)
+{
+    send_iac(TEL_WILL, OPT_ECHO);
+    send_iac(TEL_WILL, OPT_SGA);
+    send_iac(TEL_DONT, OPT_LINEMODE);
+}
+
 /* ---------------- the micro handler (one connection) ------------------- */
 
 static void handle_session(void)
@@ -128,7 +172,16 @@ static void handle_session(void)
     BOOL ended = FALSE;
 
     while (!ended) {
-        Wait(1UL << hdlPort->mp_SigBit | SIGBREAKF_CTRL_C);
+        ULONG sigs = Wait(1UL << hdlPort->mp_SigBit | SIGBREAKF_CTRL_C);
+        if ((sigs & SIGBREAKF_CTRL_C) && gSock >= 0) {
+            /* Close the connection; reads then fail as EOF, the shell
+             * exits cleanly, ACTION_END arrives, and the daemon stops. */
+            PutStr((STRPTR)"telnetd: break - closing session\n");
+            shutdown(gSock, 2);
+            CloseSocket(gSock);
+            gSock = -1;
+            gBreak = TRUE;
+        }
 
         while ((msg = GetMsg(hdlPort)) != NULL) {
             pkt = (struct DosPacket *)msg->mn_Node.ln_Name;   /* msg -> packet */
@@ -138,7 +191,7 @@ static void handle_session(void)
                 LONG n, k, r;
                 for (;;) {
                     r = recv(gSock, (char *)buf, IOBUF, 0);
-                    if (r < 0) { ReplyPkt(pkt, DOSFALSE, Errno()); n = -1; break; }
+                    if (r < 0) { ReplyPkt(pkt, 0, 0); n = -1; break; }  /* gone = EOF */
                     if (r == 0) { ReplyPkt(pkt, 0, 0); n = -1; break; }  /* EOF */
                     n = filter_input(buf, r);
                     if (n > 0) break;            /* skip pure-IAC packets */
@@ -150,10 +203,23 @@ static void handle_session(void)
                 break;
             }
             case ACT_WRITE: {
-                LONG n = pkt->dp_Arg3;
-                LONG k = send_all(gSock, (const unsigned char *)pkt->dp_Arg2, n);
+                const unsigned char *p = (const unsigned char *)pkt->dp_Arg2;
+                LONG n = pkt->dp_Arg3, i, w = 0, k = 0;
+                for (i = 0; i < n && k >= 0; i++) {
+                    unsigned char c = p[i];
+                    buf[w++] = c;
+                    if (c == 10 && (i == 0 || p[i - 1] != 13)) {
+                        buf[w - 1] = 13;         /* bare LF -> CRLF (NVT) */
+                        buf[w++] = 10;
+                    }
+                    if (w >= IOBUF - 2) {        /* room for a full CRLF pair */
+                        k = send_all(gSock, buf, w);
+                        w = 0;
+                    }
+                }
+                if (k >= 0 && w > 0) k = send_all(gSock, buf, w);
                 if (k < 0) ReplyPkt(pkt, DOSFALSE, Errno());
-                else       ReplyPkt(pkt, k, 0);
+                else       ReplyPkt(pkt, n, 0);
                 break;
             }
             case ACT_END:
@@ -246,6 +312,8 @@ int main(int argc, char **argv)
 
         gSock  = csock;
         gDone  = FALSE;
+        gBreak = FALSE;
+        negotiate_start();
 
         fh = AllocMem(sizeof(struct MiniFH), MEMF_CLEAR | MEMF_PUBLIC);
         if (!fh) { CloseSocket(gSock); gSock = -1; continue; }
@@ -268,6 +336,7 @@ int main(int argc, char **argv)
         handle_session();           /* serves packets until shell exits */
         FreeMem(fh, sizeof(struct MiniFH));
         fh = NULL;
+        if (gBreak) { PutStr((STRPTR)"telnetd: stopped\n"); break; }
         PutStr((STRPTR)"telnetd: session closed — waiting for next\n");
     }
 

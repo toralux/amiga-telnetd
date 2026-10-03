@@ -1,4 +1,4 @@
-# amiga-telnetd
+# amiga-telnetd — v0.1
 
 A really simple standalone telnet daemon for classic AmigaOS.
 
@@ -59,9 +59,11 @@ endif
 
 ## Telnet client notes
 
-Option negotiation is not implemented: IAC sequences are filtered on input
-and the daemon echoes what you type. If your client misbehaves in line mode,
-switch to character mode: Ctrl-] then `mode character` (BSD telnet).
+Minimal negotiation is built in: on connect the daemon asks the client for
+character mode with server echo (WILL ECHO, WILL SGA, DONT LINEMODE) and
+refuses every other option, so stock clients work out of the box. Output is
+translated to NVT CRLF. If your client still line-edits oddly, force it:
+Ctrl-] then `mode character` (BSD telnet).
 
 ## Build (x64 Linux cross toolchain)
 
