@@ -3,11 +3,24 @@ on: [push, workflow_dispatch]
 jobs:
   build:
     runs-on: ubuntu-latest
-    container:
-      image: walkero/amiga-gcc:latest   # m68k-amigaos-gcc cross toolchain
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install m68k-amigaos-gcc (AmigaPorts prebuilt tarball)
+        run: |
+          URL=$(curl -s https://api.github.com/repos/AmigaPorts/m68k-amigaos-gcc/releases/latest                 | grep browser_download_url | grep x86_64-linux | cut -d '"' -f 4)
+          echo "toolchain: $URL"
+          sudo mkdir -p /opt/m68k
+          curl -sSL "$URL" -o /tmp/gcc.tar.xz
+          sudo tar -xJf /tmp/gcc.tar.xz -C /opt/m68k
+          BIN=$(dirname "$(sudo find /opt/m68k -type f -name m68k-amigaos-gcc | head -1)")
+          echo "$BIN" >> "$GITHUB_PATH"
+
+      - name: Show compiler
+        run: m68k-amigaos-gcc --version | head -1
+
       - run: make
+
       - uses: actions/upload-artifact@v4
         with:
           name: telnetd-m68k
