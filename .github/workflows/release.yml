@@ -1,0 +1,44 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install m68k-amigaos-gcc (AmigaPorts prebuilt toolchain)
+        run: |
+          URL=$(curl -s https://api.github.com/repos/AmigaPorts/m68k-amigaos-gcc/releases/latest | grep browser_download_url | grep x86_64-linux | cut -d '"' -f 4)
+          echo "toolchain: $URL"
+          sudo mkdir -p /opt/m68k
+          curl -sSL "$URL" -o /tmp/gcc.tar.xz
+          sudo tar -xJf /tmp/gcc.tar.xz -C /opt/m68k
+          BIN=$(dirname "$(sudo find /opt/m68k -type f -name m68k-amigaos-gcc | head -1)")
+          echo "$BIN" >> "$GITHUB_PATH"
+
+      - run: make
+
+      - name: Tag must match the version cookie in the binary
+        run: |
+          VER=$(strings -a telnetd | grep -o '\$VER: telnetd [0-9.]*' | head -1 | awk '{print $3}')
+          TAGFULL="${GITHUB_REF_NAME#v}"
+          TAGVER="${TAGFULL%%-*}"
+          echo "cookie=$VER  tag=$TAGVER"
+          test "$VER" = "$TAGVER" || { echo "::error::tag $TAGFULL does not match the \$VER cookie $VER - bump the verstag in telnetd.c first"; exit 1; }
+
+      - name: Create release with the binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          case "$TAG" in
+            *-*) FLAGS="--prerelease" ;;   # v0.1-pre1, v0.1-rc2, ...
+            *)  FLAGS="" ;;                # v0.1 -> full release
+          esac
+          gh release create "$TAG" --title "telnetd ${GITHUB_REF_NAME#v}" --generate-notes $FLAGS telnetd README.md LICENSE
