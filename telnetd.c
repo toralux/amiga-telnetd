@@ -380,7 +380,7 @@ int main(int argc, char **argv)
         gBreak = FALSE;
         negotiate_start();
 
-        fhB = AllocDosObject(DOS_FILEHANDLE, NULL);
+        fhB = (BPTR)AllocDosObject(DOS_FILEHANDLE, NULL);
         if (!fhB) { CloseSocket(gSock); gSock = -1; continue; }
         fh = BADDR(fhB);
         fh->fh_Type = hdlPort;
