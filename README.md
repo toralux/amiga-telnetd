@@ -1,16 +1,18 @@
-# amiga-telnetd — v0.1
+# amiga-telnetd
 
-A really simple standalone telnet daemon for classic AmigaOS.
+A really simple standalone telnet daemon for AmigaOS 2.04+ (tested on
+AmigaOS 3.1 / A500 68000). No inetd, no config files, no user database,
+no authentication. One connection at a time, real AmigaDOS shell per
+connection. Needs a bsdsocket TCP/IP stack (AmiTCP, AmiTCP_NG, Roadshow,
+Miami).
 
-- **No inetd** — it listens by itself
-- **No config files, no user database, no authentication**
-- **No UI** — plain CLI program
-- One connection at a time, real AmigaDOS shell per connection
-- 68000 baseline, AmigaOS 2.04+ (tested target: 3.1), needs a bsdsocket TCP/IP stack (AmiTCP, AmiTCP_NG, Roadshow, Miami)
+**License: GPLv2.** The session architecture (packet-serving filehandle,
+`NewShell *` spawn recipe, ACTION_WAIT_CHAR/SCREEN_MODE handling) is
+ported from **telnetd 2.0** by Peter Simons & Steve Holland (1995,
+GPLv2), adapted for AmiTCP_NG 4.x: no inetd, no usergroup.library, LAN
+only. See docs/DESIGN.md for the full architecture and provenance.
 
 ## Run
-
-First run: foreground, from a Shell, so you can watch the log lines:
 
 ```amigados
 1> stack 20000
@@ -20,17 +22,15 @@ First run: foreground, from a Shell, so you can watch the log lines:
 
 Then from any machine on the LAN: `telnet <amiga-ip>` and you get an
 AmigaDOS shell. `EndCLI` (or `exit`) closes the session; the daemon waits
-for the next connection. Ctrl-C in the starting Shell stops the daemon
-(between sessions; during a session, close the telnet client first).
+for the next connection. Ctrl-C in the starting Shell stops the daemon —
+between sessions or mid-session.
 
 ### Do I need `stack 20000`?
 
-Recommended, belt-and-braces. The daemon's large buffers are static (not on
-the stack) and the shell it spawns gets an explicit 64 KB stack of its own,
-so the default 4 KB CLI stack will most likely work — but bsdsocket and DOS
-packet internals on a 68000 are exactly where a snug stack bites, and the
-one-line insurance is free. Set it once in the Shell (or in User-Startup
-before `run`) and forget about it.
+Recommended, belt-and-braces. The daemon's large buffers are static (not
+on the stack) and the shell it spawns gets an explicit 64 KB stack of its
+own, so the default 4 KB CLI stack will most likely work — but bsdsocket
+and DOS packet internals on a 68000 are exactly where a snug stack bites.
 
 ### Running in the background
 
@@ -45,62 +45,14 @@ With no console there is nothing to Ctrl-C, so stop it from any Shell:
 1> Break <n> C       ; n = its process number
 ```
 
-### Starting at boot
-
-Add to `S:User-Startup` — **after** the line(s) that bring up the TCP/IP
-stack (AmiTCP / AmiTCP_NG / Roadshow), or the daemon exits with
-"no bsdsocket.library":
-
-```amigados
-if exists C:telnetd
-  run >NIL: C:telnetd
-endif
-```
-
 ## Telnet client notes
 
-Minimal negotiation is built in: on connect the daemon asks the client for
-character mode with server echo (WILL ECHO, WILL SGA, DONT LINEMODE) and
-refuses every other option, so stock clients work out of the box. Output is
-translated to NVT CRLF. If your client still line-edits oddly, force it:
-Ctrl-] then `mode character` (BSD telnet).
+Minimal negotiation is built in: on connect the daemon asks the client
+for character mode with server echo (WILL ECHO, WILL SGA, DONT LINEMODE)
+and refuses every other option, so stock clients work out of the box.
+Output is translated to NVT CRLF; `SetMode()` (raw mode, e.g. for
+password prompts) is supported with proper echo negotiation.
 
-## Build (x64 Linux cross toolchain)
+WARNING: no authentication, no encryption — LAN use only, never
+port-forward. A shell over telnet is total remote access.
 
-```bash
-# toolchain: https://github.com/AmigaPorts/m68k-amigaos-gcc
-m68k-amigaos-gcc -Os -m68000 -Wall -o telnetd telnetd.c -s -lamiga
-# or
-make
-```
-
-GitHub Actions builds the binary on every push (see .github/workflows).
-
-**Prebuilt binaries:** [Releases](https://github.com/toralux/amiga-telnetd/releases) — every `v*` tag builds and publishes automatically. The tag must match the $VER cookie in the source (bump the verstag first), and -suffix tags such as `v0.1-pre1` are published as pre-releases.
-
-## How it works
-
-For each accepted connection the daemon builds a DOS filehandle whose
-handler is a packet loop inside the daemon itself, backed by the socket.
-`System("NewShell *")` then starts a CLI attached to that handle. When the
-shell exits, ACTION_END arrives, the socket closes, the next connection is
-accepted. The packet-handler approach follows the classic AmiTCP-era
-daemons (telnetd 2.0 / fakesr.device, ttyhandler), collapsed into one file
-with no extra components.
-
-## Test plan (hardware)
-
-1. `stack 20000` then `telnetd` — expect "listening on port 23"
-2. From the LAN: `telnet <amiga-ip>` — expect an AmigaDOS prompt with echo
-3. `dir`, `version`, `avail` — output should stream back
-4. `endcli` — session closes, daemon waits for next connection
-5. Ctrl-C the daemon between connections
-
-## Security
-
-No authentication, plaintext protocol. LAN use only — never port-forward.
-
-## License
-
-MIT — see LICENSE. The design follows the public AmiTCP-era daemons
-(telnetd 2.0 / fakesr.device by P. Simons & S. Holland; ttyhandler by K. Melkko).
