@@ -61,7 +61,7 @@
 #endif
 
 static const char __attribute__((used)) verstag[] =
-    "$VER: telnetd 0.1.1 (6.10.2026)";
+    "$VER: telnetd 0.1.2 (6.10.2026)";
 
 /* Telnet protocol bytes we care about (minimal NVT negotiation) */
 #define TEL_IAC      255
@@ -86,14 +86,9 @@ static int              gSock     = -1;
 static BOOL             gDone     = FALSE;
 static BOOL             gBreak    = FALSE;
 
-/* Hand-built DOS FileHandle image: fh_Type = our port, fh_Arg1 = socket */
-struct MiniFH {
-    struct MsgPort *fh_Type;
-    LONG  fh_ID, fh_Mode;
-    BPTR  fh_Buf, fh_Pos;
-    LONG  fh_End;
-    ULONG fh_Arg1;
-};
+#ifndef BADDR
+#define BADDR(x)  ((APTR)(((ULONG)(x)) << 2))
+#endif
 
 static void send_iac(int cmd, int opt);
 
@@ -314,7 +309,7 @@ int main(int argc, char **argv)
     LONG args[2] = { 0, 0 };
     struct RDArgs *rd;
     struct sockaddr_in sa;
-    struct MiniFH *fh = NULL;
+    struct FileHandle *fh = NULL;
     BPTR fhB = 0;
     ULONG port = 23;
     int one = 1;
@@ -385,11 +380,11 @@ int main(int argc, char **argv)
         gBreak = FALSE;
         negotiate_start();
 
-        fh = AllocMem(sizeof(struct MiniFH), MEMF_CLEAR | MEMF_PUBLIC);
-        if (!fh) { CloseSocket(gSock); gSock = -1; continue; }
+        fhB = AllocDosObject(DOS_FILEHANDLE, NULL);
+        if (!fhB) { CloseSocket(gSock); gSock = -1; continue; }
+        fh = BADDR(fhB);
         fh->fh_Type = hdlPort;
         fh->fh_Arg1 = (ULONG)gSock;
-        fhB = MKBADDR(fh);
 
         PutStr((STRPTR)"telnetd: connection — starting shell\n");
         if (SystemTags((STRPTR)"NewShell *",
@@ -398,6 +393,8 @@ int main(int argc, char **argv)
                        SYS_Asynch,  TRUE,
                        SYS_UserShell, TRUE,
                        NP_StackSize, 65536,
+                       NP_ConsoleTask, hdlPort,
+                       NP_Cli, TRUE,
                        TAG_DONE) == -1) {
             PutStr((STRPTR)"telnetd: could not start shell\n");
             Close(fhB);
@@ -405,7 +402,7 @@ int main(int argc, char **argv)
         }
         /* serves packets until the shell ends (or the session is torn down) */
         if (handle_session()) {
-            FreeMem(fh, sizeof(struct MiniFH));
+            FreeDosObject(DOS_FILEHANDLE, fhB);
         } else {
             /* an abandoned shell may still reference the handle: leak the
              * few bytes instead of freeing them under its feet */
