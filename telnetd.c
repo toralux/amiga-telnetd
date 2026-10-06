@@ -71,7 +71,7 @@
 #endif
 
 static const char __attribute__((used)) verstag[] =
-    "$VER: telnetd 0.2 (6.10.2026)";
+    "$VER: telnetd 0.2.2 (6.10.2026)";
 
 /* Telnet protocol bytes */
 #define TEL_IAC      255
@@ -243,6 +243,7 @@ static BOOL session_loop(void)
 
         if (mask & SIGBREAKF_CTRL_C) {
             PutStr((STRPTR)"telnetd: break - closing session\n");
+            PutStr((STRPTR)"dbg: ctrl-c in session\n");
             gBreak = TRUE;
             ended = TRUE;
             break;
@@ -315,6 +316,7 @@ static BOOL session_loop(void)
         while ((msg = GetMsg(pktPort)) != NULL) {
             silent = 0;
             pkt = pkt_from_msg(msg);
+            Printf((STRPTR)"dbg: pkt type %ld\n", (LONG)pkt->dp_Type);
             switch (pkt->dp_Type) {
 
             case ACTION_FINDINPUT:
@@ -495,22 +497,32 @@ int main(int argc, char **argv)
             if (mask & SIGBREAKF_CTRL_C) { PutStr((STRPTR)"telnetd: break\n"); break; }
             if (selr <= 0) continue;
         }
-        gSock = accept(gListen, NULL, NULL);
-        if (gSock < 0) continue;
+        {
+            struct sockaddr_in ca;
+            socklen_t calen = sizeof ca;   /* REAL buffers: NULL addr/len hits an
+                                       * address error on this stack (the
+                                       * 80000003 crash of v0.1-0.2.1) */
+            gSock = accept(gListen, (struct sockaddr *)&ca, &calen);
+        }
+        if (gSock < 0) { PutStr((STRPTR)"dbg: accept failed\n"); continue; }
+        PutStr((STRPTR)"dbg: accepted\n");
 
         negotiate_start();
+        PutStr((STRPTR)"dbg: negotiated\n");
 
         /* The session handle: handler = our own pr_MsgPort, unbuffered. */
         fhB = (BPTR)AllocDosObject(DOS_FILEHANDLE, NULL);
-        if (!fhB) { CloseSocket(gSock); gSock = -1; continue; }
+        if (!fhB) { PutStr((STRPTR)"dbg: no handle\n"); CloseSocket(gSock); gSock = -1; continue; }
         fh = (struct FileHandle *)BADDR(fhB);
         fh->fh_Type = &self->pr_MsgPort;
         fh->fh_Port = &self->pr_MsgPort;      /* interactive flag (by tradition) */
         fh->fh_Arg1 = (LONG)gSock;
         fh->fh_Pos  = -1;
         fh->fh_End  = -1;
+        PutStr((STRPTR)"dbg: handle ready\n");
 
         PutStr((STRPTR)"telnetd: connection - starting shell\n");
+        PutStr((STRPTR)"dbg: calling SystemTags\n");
         /* The proven telnetd 2.0 spawn: NewShell * on our handle as both
          * stdio and console task, as a CLI process. No SYS_UserShell. */
         if (SystemTags((STRPTR)"NewShell *",
@@ -521,6 +533,7 @@ int main(int argc, char **argv)
                        NP_Cli,         TRUE,
                        NP_StackSize,   65536,
                        TAG_DONE) == -1) {
+            PutStr((STRPTR)"dbg: SystemTags FAILED\n");
             PutStr((STRPTR)"telnetd: could not start shell\n");
             Close(fhB);
             while ((msg = GetMsg(&self->pr_MsgPort)) != NULL) {  /* drain END */
@@ -529,6 +542,8 @@ int main(int argc, char **argv)
             }
             continue;
         }
+
+        PutStr((STRPTR)"dbg: spawn ok - entering session loop\n");
 
         /* Stragglers from a previous abandoned shell must not leak in. */
         while ((msg = GetMsg(&self->pr_MsgPort)) != NULL) {
