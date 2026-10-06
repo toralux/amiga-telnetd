@@ -61,7 +61,7 @@
 #endif
 
 static const char __attribute__((used)) verstag[] =
-    "$VER: telnetd 0.1.2 (6.10.2026)";
+    "$VER: telnetd 0.1.3 (6.10.2026)";
 
 /* Telnet protocol bytes we care about (minimal NVT negotiation) */
 #define TEL_IAC      255
@@ -393,8 +393,6 @@ int main(int argc, char **argv)
                        SYS_Asynch,  TRUE,
                        SYS_UserShell, TRUE,
                        NP_StackSize, 65536,
-                       NP_ConsoleTask, hdlPort,
-                       NP_Cli, TRUE,
                        TAG_DONE) == -1) {
             PutStr((STRPTR)"telnetd: could not start shell\n");
             Close(fhB);
