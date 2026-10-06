@@ -61,7 +61,7 @@
 #endif
 
 static const char __attribute__((used)) verstag[] =
-    "$VER: telnetd 0.1.3 (6.10.2026)";
+    "$VER: telnetd 0.1.4 (6.10.2026)";
 
 /* Telnet protocol bytes we care about (minimal NVT negotiation) */
 #define TEL_IAC      255
@@ -161,7 +161,7 @@ static void negotiate_start(void)
 
 /* ---------------- the micro handler (one connection) ------------------- */
 
-#define RW_BREAK (-2)          /* recv_wait(): woken by SIGBREAKF_CTRL_C */
+#define RW_BREAK (-2)          /* recv_wait()/send_wait(): woken by SIGBREAKF_CTRL_C */
 
 /* Close the session socket if it is still open. */
 static void close_session(void)
@@ -195,18 +195,51 @@ static LONG recv_wait(int s, unsigned char *buf, LONG n)
     }
 }
 
+/* Like send_all(), but interruptible: waits for writability via WaitSelect
+ * with the Ctrl-C mask, so a wedged peer can no longer park the daemon
+ * inside a blocking send(). Returns bytes sent, -1 on error, RW_BREAK. */
+static LONG send_wait(int s, const unsigned char *p, LONG n)
+{
+    LONG sent = 0;
+    while (sent < n) {
+        fd_set  wr;
+        ULONG   mask = SIGBREAKF_CTRL_C;
+        LONG    selr, k;
+
+        FD_ZERO(&wr);
+        FD_SET(s, &wr);
+        selr = WaitSelect(s + 1, NULL, &wr, NULL, NULL, &mask);
+        if (mask & SIGBREAKF_CTRL_C)
+            return RW_BREAK;
+        if (selr > 0 && FD_ISSET(s, &wr)) {
+            k = send(s, (APTR)(p + sent), (int)(n - sent), 0);
+            if (k <= 0) return -1;
+            sent += k;
+        }
+        /* spurious wake or transient: wait again */
+    }
+    return sent;
+}
+
 /* Serves the packet loop for one connection. Returns TRUE when the shell
  * ended the session cleanly (ACTION_END); FALSE when the session was torn
- * down (Ctrl-C, vanished client, or a shell that never sent END). In the
+ * down (Ctrl-C, vanished client, or a shell that never got going). In the
  * FALSE case the shell may still be alive: its handle is then leaked (a
- * few bytes) rather than freed under a live shell. */
+ * few bytes) rather than freed under a live shell.
+ *
+ * 0.1.4: a Delay() poll loop instead of a bare Wait(), so two watchdogs
+ * can fire: a shell that produces NO packet at all within ~10 s of the
+ * spawn is abandoned (0.1.3 waited forever for a first packet that a
+ * crashed child never sends), and a client that vanishes gets ~5 s of
+ * grace for its shell to end before the session is dropped. Reads and
+ * writes are both interruptible by Ctrl-C. */
 static BOOL handle_session(void)
 {
     static unsigned char buf[IOBUF];
     struct Message *msg;
     struct DosPacket *pkt;
-    BOOL  ended = FALSE, gone = FALSE, clean = FALSE;
-    LONG  grace = 0;
+    BOOL  ended = FALSE, gone = FALSE, clean = FALSE, heard = FALSE;
+    LONG  silent = 0;
 
     /* Reply with errors to any packets a previously abandoned shell still
      * owes, so they cannot leak into this session. */
@@ -216,25 +249,9 @@ static BOOL handle_session(void)
     }
 
     while (!ended) {
-        if (gone) {
-            /* The client is gone. A healthy shell reads EOF and sends END;
-             * one that died mid-write never does, so do not wait forever:
-             * poll briefly for END, then abandon the session. */
-            Delay(10);                          /* 0.2 s */
-            if (++grace > 25) {                 /* ~5 s cap */
-                PutStr((STRPTR)"telnetd: shell did not end - abandoning\n");
-                break;
-            }
-        } else {
-            ULONG sigs = Wait(1UL << hdlPort->mp_SigBit | SIGBREAKF_CTRL_C);
-            if (sigs & SIGBREAKF_CTRL_C) {
-                PutStr((STRPTR)"telnetd: break - closing session\n");
-                gBreak = TRUE;
-                break;
-            }
-        }
-
         while ((msg = GetMsg(hdlPort)) != NULL) {
+            heard = TRUE;
+            silent = 0;
             pkt = (struct DosPacket *)msg->mn_Node.ln_Name;
 
             switch (pkt->dp_Type) {
@@ -260,15 +277,22 @@ static BOOL handle_session(void)
                     gone = TRUE;
                     break;
                 }
-                k = send_all(gSock, buf, n);             /* server-side echo */
+                k = send_wait(gSock, buf, n);            /* server-side echo */
+                if (k == RW_BREAK) {
+                    ReplyPkt(pkt, 0, 0);
+                    gBreak = TRUE;
+                    ended = TRUE;
+                    break;
+                }
                 if (k < 0) { ReplyPkt(pkt, DOSFALSE, Errno()); gone = TRUE; break; }
                 ReplyPkt(pkt, n, 0);
                 break;
             }
             case ACT_WRITE: {
                 const unsigned char *p = (const unsigned char *)pkt->dp_Arg2;
-                LONG n = pkt->dp_Arg3, i, w = 0, k = 0;
-                for (i = 0; i < n && k >= 0; i++) {
+                LONG n = pkt->dp_Arg3, i, w = 0;
+                LONG ec = 0, k;                          /* 0 ok, 1 gone, 2 break */
+                for (i = 0; i < n && !ec; i++) {
                     unsigned char c = p[i];
                     buf[w++] = c;
                     if (c == 10 && (i == 0 || p[i - 1] != 13)) {
@@ -276,13 +300,20 @@ static BOOL handle_session(void)
                         buf[w++] = 10;
                     }
                     if (w >= IOBUF - 2) {                /* room for a CRLF pair */
-                        k = send_all(gSock, buf, w);
-                        w = 0;
+                        k = send_wait(gSock, buf, w);
+                        if (k == RW_BREAK) ec = 2;
+                        else if (k < 0)    ec = 1;
+                        else               w = 0;
                     }
                 }
-                if (k >= 0 && w > 0) k = send_all(gSock, buf, w);
-                if (k < 0) { ReplyPkt(pkt, DOSFALSE, Errno()); gone = TRUE; }
-                else       ReplyPkt(pkt, n, 0);
+                if (!ec && w > 0) {
+                    k = send_wait(gSock, buf, w);
+                    if (k == RW_BREAK) ec = 2;
+                    else if (k < 0)    ec = 1;
+                }
+                if (ec == 2) { ReplyPkt(pkt, DOSFALSE, 0); gBreak = TRUE; ended = TRUE; }
+                else if (ec == 1) { ReplyPkt(pkt, DOSFALSE, Errno()); gone = TRUE; }
+                else              ReplyPkt(pkt, n, 0);
                 break;
             }
             case ACT_END:
@@ -295,6 +326,24 @@ static BOOL handle_session(void)
                 break;
             }
             if (ended) break;
+        }
+        if (ended) break;
+
+        if (CheckSignal(SIGBREAKF_CTRL_C)) {
+            PutStr((STRPTR)"telnetd: break - closing session\n");
+            gBreak = TRUE;
+            break;
+        }
+        Delay(5);                                        /* 0.1 s */
+        silent++;
+
+        if (!heard && silent > 100) {                    /* no packet ~10 s after spawn */
+            PutStr((STRPTR)"telnetd: shell produced no session - abandoning\n");
+            break;
+        }
+        if (heard && gone && silent > 50) {              /* client gone, no END in ~5 s */
+            PutStr((STRPTR)"telnetd: shell did not end - abandoning\n");
+            break;
         }
     }
     close_session();
