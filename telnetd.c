@@ -61,7 +61,7 @@
 #endif
 
 static const char __attribute__((used)) verstag[] =
-    "$VER: telnetd 0.1.4 (6.10.2026)";
+    "$VER: telnetd 0.1.5 (6.10.2026)";
 
 /* Telnet protocol bytes we care about (minimal NVT negotiation) */
 #define TEL_IAC      255
@@ -434,6 +434,13 @@ int main(int argc, char **argv)
         fh = BADDR(fhB);
         fh->fh_Type = hdlPort;
         fh->fh_Arg1 = (ULONG)gSock;
+        /* telnetd 2.0 idiom (the #80000003 fix): mark the buffer empty
+         * with the -1 sentinel so DOS/shell buffered I/O never does
+         * arithmetic on the absent buffer, and flag the handle
+         * interactive (fh_Port is a boolean by tradition). */
+        fh->fh_Pos  = -1;
+        fh->fh_End  = -1;
+        fh->fh_Port = fh->fh_Type;
 
         PutStr((STRPTR)"telnetd: connection — starting shell\n");
         if (SystemTags((STRPTR)"NewShell *",
