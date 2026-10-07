@@ -1,5 +1,8 @@
 /*
  * telnetd.c — a standalone telnet daemon for AmigaOS 2.04+
+ * v0.4.1: shell spawned from a helper process (sync SystemTags + NP_Cli,
+ *   the telnetd 2.0 recipe) - direct SystemTags(SYS_Asynch) from the
+ *   daemon hung forever on real hardware (v0.4 field test 07-Oct-2026).
  * v0.4: session architecture follows the approach of telnetd 2.0 (Peter
  * Simons & Steve Holland, 1995), reimplemented for AmiTCP_NG 4.x: no
  * inetd, no usergroup.library, one connection at a time, LAN-only.
@@ -10,8 +13,10 @@
  * Mechanism:
  *   The daemon owns one PRIVATE handler port (CreateMsgPort) for its whole
  *   life. For each connection it makes two DOS filehandles whose fh_Type
- *   is that port and runs System("NewShell *", SYS_Asynch) with them as
- *   stdio and NP_ConsoleTask = the port. The shell's console traffic then
+ *   is that port, then a short-lived helper process runs SystemTags(
+ *   "NewShell *") synchronously - it blocks until the shell exits - with
+ *   them as stdio and NP_ConsoleTask = the port. The shell's console
+ *   traffic then
  *   arrives as DosPackets on the private port and is served here:
  *     ACTION_FIND*         — "*" opened again: opencount++
  *     ACTION_READ          — queued; cooked: completed per line,
@@ -92,7 +97,7 @@
 #endif
 
 static const char __attribute__((used)) verstag[] =
-    "$VER: telnetd 0.4 (7.10.2026)";
+    "$VER: telnetd 0.4.4 (7.10.2026)";
 
 /* Telnet protocol bytes */
 #define TEL_IAC      255
@@ -108,8 +113,8 @@ static const char __attribute__((used)) verstag[] =
 #define OPT_SGA        3
 
 /* bsdsocket errno values (BSD numbering, as returned by Errno()) */
-#define SOCK_EINTR         4
-#define SOCK_EWOULDBLOCK  35
+#define SOCK_EINTR         4   /* AmiTCP BSD numbering */
+#define SOCK_EWOULDBLOCK   6   /* AmiTCP: 6, NOT Linux 35 - v0.4.3 had 35 and every would-block was fatal */
 
 #define IOBUF        1024
 #define MIN_STACK    16000            /* refuse to run on a smaller stack */
@@ -181,7 +186,10 @@ static LONG send_all(const unsigned char *p, LONG n)
     while (sent < n) {
         LONG k = send(gSock, (APTR)(p + sent), (int)(n - sent), 0);
         if (k > 0) { sent += k; stalls = 0; continue; }
-        if (k < 0 && (Errno() == SOCK_EWOULDBLOCK || Errno() == SOCK_EINTR)) {
+        if (k < 0) { LONG se = Errno(); logmsg("telnetd: sendfail k %ld\n", k); logmsg("telnetd: sendfail e %ld\n", se); if (se != SOCK_EWOULDBLOCK && se != SOCK_EINTR) return -1; }
+        else if (k < 0) { return -1; }
+        if (k == 0) return -1;
+        if (k < 0 && (0)) {
             fd_set wr;
             struct timeval tv;
             ULONG mask = 0;
@@ -294,6 +302,7 @@ static LONG in_byte(unsigned char *c)
 {
     if (gInHead == gInTail) {
         LONG n = recv(gSock, (APTR)gIn, sizeof gIn, 0);
+        if (n > 0) logmsg("telnetd: recv %ld\n", n);
         if (n == 0) return 0;
         if (n < 0) {
             LONG e = Errno();
@@ -430,7 +439,7 @@ static void service_reads(void)
 
         if (pkt->dp_Type == ACTION_WAIT_CHAR) {
             r = next_char(&ch);
-            if (r == 0) { do_hangup(); return; }
+            if (r == 0) { logmsg("telnetd: hangup read eof\n", 0); do_hangup(); return; }
             if (r < 0) return;
             gPeek = ch;                        /* the next READ gets it */
             stop_timer(pkt);
@@ -443,7 +452,7 @@ static void service_reads(void)
         for (;;) {
             if (pkt->dp_Res1 >= pkt->dp_Arg3) break;
             r = next_char(&ch);
-            if (r == 0) { do_hangup(); return; }
+            if (r == 0) { logmsg("telnetd: hangup read eof\n", 0); do_hangup(); return; }
             if (r < 0) {
                 if (gRaw && pkt->dp_Res1 > 0) break;
                 return;                        /* wait for more input */
@@ -453,18 +462,27 @@ static void service_reads(void)
             if (!gRaw && ch == '\n') break;
         }
         Remove(&msg->mn_Node);
+        logmsg("telnetd: read done %ld\n", pkt->dp_Res1);
         reply(pkt, pkt->dp_Res1, 0);
     }
 }
 
+/* v0.4.3: serve READ/WRITE/END unconditionally while a session is live -
+ * exactly what telnetd 2.0 does. The instrumented v0.4.2 run proved why
+ * per-packet identity cannot work here: dos.library stores the FIND
+ * reply's dp_Arg1 into fh_Arg1, so every later packet carries
+ * dp_Arg1 = whatever FIND replied (we replied DOSTRUE = 1) - neither a
+ * handle BPTR nor a session number. Stale packets are still rejected by
+ * the state machine: between sessions gCookie is 0 and gHangup gates,
+ * as in 2.0. */
+
 /* Serves one packet from the handler port. Packets from handles of an
- * earlier session (dp_Arg1 != gCookie) or arriving between sessions are
+ * earlier session (stale fh_Arg1) or arriving between sessions are
  * answered without touching the current connection. */
 static void handle_packet(struct Message *msg)
 {
     struct DosPacket *pkt = pkt_of(msg);
     BOOL live = (gCookie != 0 && !gHangup);
-    BOOL mine = (gCookie != 0 && pkt->dp_Arg1 == gCookie);
 
     switch (pkt->dp_Type) {
 
@@ -477,21 +495,25 @@ static void handle_packet(struct Message *msg)
         fh->fh_Port = gPort;                   /* non-zero = interactive */
         fh->fh_Arg1 = gCookie;                 /* 0 between sessions: a dead handle */
         if (gCookie) { gOpens++; gSawOpen = TRUE; }
+        logmsg("telnetd: find, opens %ld\n", gOpens);
         reply(pkt, DOSTRUE, 0);
         break;
     }
 
     case ACTION_READ:
-        if (!mine || gHangup) { reply(pkt, 0, 0); break; }   /* EOF */
+        if (!live) { reply(pkt, 0, 0); break; }   /* EOF: 2.0 semantics, no per-packet identity */
         note_reader(pkt);
         pkt->dp_Res1 = 0;
+        logmsg("telnetd: read queued\n", 0);
         AddTail(&gReadWait, &msg->mn_Node);
         break;
 
     case ACTION_WRITE:
-        if (mine && live &&
-            sock_write((const unsigned char *)pkt->dp_Arg2, pkt->dp_Arg3) < 0)
+        logmsg("telnetd: write %ld\n", pkt->dp_Arg3);
+        if (live && sock_write((const unsigned char *)pkt->dp_Arg2, pkt->dp_Arg3) < 0) {
+            logmsg("telnetd: hangup write fail\n", 0);
             do_hangup();
+        }
         reply(pkt, pkt->dp_Arg3, 0);          /* output nobody can see is discarded */
         break;
 
@@ -524,17 +546,15 @@ static void handle_packet(struct Message *msg)
 
     case ACTION_CHANGE_SIGNAL: {
         struct MsgPort *np = (struct MsgPort *)pkt->dp_Arg2;
-        if (mine && np && np->mp_SigTask) gBreakTask = (struct Task *)np->mp_SigTask;
+        if (live && np && np->mp_SigTask) gBreakTask = (struct Task *)np->mp_SigTask;
         reply(pkt, DOSTRUE, 0);
         break;
     }
 
     case ACTION_END:
         reply(pkt, DOSTRUE, 0);
-        if (mine) {
-            gOpens--;
-            logmsg("telnetd: END, %ld handles left\n", gOpens);
-        }
+        gOpens--;
+        logmsg("telnetd: END, %ld handles left\n", gOpens);
         break;
 
     case ACTION_SEEK:
@@ -567,6 +587,35 @@ static void drain_port(void)
  * field below was written to 4x the real address - on a 24-bit 68000 bus
  * that is anywhere from chip RAM to the CIAs and custom chips. telnetd
  * 2.0 converts with MKBADDR, as done here. */
+/* v0.4.1: the spawn runs in this short-lived helper, never in the
+ * daemon. telnetd 2.0's rule: the process that calls System must be the
+ * one willing to block until the shell exits. A direct
+ * SystemTags(SYS_Asynch) from the daemon hung forever on real hardware
+ * (v0.4 field test, 07-Oct-2026: trail ends inside the call, no
+ * "shell started", no "SystemTags failed"). */
+static BPTR g_spawnIn = 0, g_spawnOut = 0;
+
+static int spawner_entry(void)
+{
+    struct Library *dosBase;
+    LONG rc;
+
+    dosBase = OpenLibrary((STRPTR)"dos.library", 36);
+    if (!dosBase) return RETURN_FAIL;
+
+    rc = SystemTags((STRPTR)"NewShell *",
+                    SYS_Input,      g_spawnIn,
+                    SYS_Output,     g_spawnOut,
+                    NP_ConsoleTask, (LONG)gPort,
+                    NP_Cli,         TRUE,
+                    TAG_DONE);
+    /* Blocked here until the shell exits. The child's process cleanup
+     * closes the two handles (ACTION_END each); never touch them here. */
+    logmsg("telnetd: helper rc %ld\n", rc);
+    CloseLibrary(dosBase);
+    return (int)rc;
+}
+
 static BPTR make_handle(void)
 {
     struct FileHandle *fh = (struct FileHandle *)AllocDosObject(DOS_FILEHANDLE, NULL);
@@ -584,7 +633,6 @@ static BPTR make_handle(void)
 static void run_session(void)
 {
     BPTR in, out;
-    LONG rc;
     LONG start = now_secs(), hangupAt = 0;
     ULONG one = 1;
 
@@ -612,25 +660,32 @@ static void run_session(void)
         goto done;
     }
 
-    /* Two distinct handles: with SYS_Asynch, DOS closes both when the
-     * command ends (one ACTION_END each). NewShell opens "*" on
-     * NP_ConsoleTask = gPort for the interactive shell it starts. */
+    /* Two distinct handles: when the spawned shell exits, its process
+     * cleanup closes them (one ACTION_END each; if DOS skips that the
+     * hangup path still ends the session - leaked handles, not freed
+     * under a live shell). NewShell opens "*" on NP_ConsoleTask = gPort
+     * for the interactive shell it starts. */
     gOpens = 2;
     logmsg("telnetd: session %ld, spawning shell\n", gCookie);
-    rc = SystemTags((STRPTR)"NewShell *",
-                    SYS_Input,      in,
-                    SYS_Output,     out,
-                    SYS_Asynch,     TRUE,
-                    NP_ConsoleTask, (LONG)gPort,
-                    TAG_DONE);
-    if (rc == -1) {
-        /* On failure the caller still owns the handles (System autodoc). */
-        PutStr((STRPTR)"telnetd: could not start NewShell\n");
-        logmsg("telnetd: SystemTags failed\n", 0);
-        FreeDosObject(DOS_FILEHANDLE, (APTR)BADDR(in));
-        FreeDosObject(DOS_FILEHANDLE, (APTR)BADDR(out));
-        gOpens = 0;
-        goto done;
+    g_spawnIn  = in;
+    g_spawnOut = out;
+    {
+        struct TagItem ptags[4];
+        ptags[0].ti_Tag  = NP_Entry;
+        ptags[0].ti_Data = (LONG)spawner_entry;
+        ptags[1].ti_Tag  = NP_StackSize;
+        ptags[1].ti_Data = 20000;
+        ptags[2].ti_Tag  = NP_Name;
+        ptags[2].ti_Data = (LONG)"telnetd shell";
+        ptags[3].ti_Tag  = TAG_END;
+        ptags[3].ti_Data = 0;
+        if (CreateNewProc(ptags) == NULL) {
+            logmsg("telnetd: CreateNewProc failed\n", 0);
+            FreeDosObject(DOS_FILEHANDLE, (APTR)BADDR(in));
+            FreeDosObject(DOS_FILEHANDLE, (APTR)BADDR(out));
+            gOpens = 0;
+            goto done;
+        }
     }
     logmsg("telnetd: shell started\n", 0);
 
@@ -659,6 +714,7 @@ static void run_session(void)
         if ((mask & SIGBREAKF_CTRL_C) && !gHangup) {
             PutStr((STRPTR)"telnetd: break - ending session\n");
             gBreak = TRUE;
+            logmsg("telnetd: hangup break\n", 0);
             do_hangup();
         }
 
