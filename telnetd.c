@@ -97,7 +97,7 @@
 #endif
 
 static const char __attribute__((used)) verstag[] =
-    "$VER: telnetd 0.4.6 (7.10.2026)";
+    "$VER: telnetd 0.4.7 (7.10.2026)";
 
 /* Telnet protocol bytes */
 #define TEL_IAC      255
@@ -118,7 +118,10 @@ static const char __attribute__((used)) verstag[] =
 
 #define IOBUF        1024
 #define MIN_STACK    16000            /* refuse to run on a smaller stack */
-#define DRAIN_SECS   30               /* after hangup the shell must end by then */
+#define DRAIN_SECS   10
+#ifndef MSG_PEEK
+#define MSG_PEEK     2                /* AmiTCP: in case headers lack it */
+#endif               /* after hangup the shell must end by then */
 #define SPAWN_SECS   10               /* NewShell must open "*" by then */
 
 struct Library *SocketBase = NULL;    /* extern in proto/bsdsocket.h */
@@ -708,11 +711,18 @@ static void run_session(void)
         }
 
         FD_ZERO(&rd);
-        if (!gHangup && gReadWait.lh_Head->ln_Succ)
-            FD_SET(gSock, &rd);                 /* only read while someone waits */
+        if (!gHangup) FD_SET(gSock, &rd);       /* always watch: catch disconnect while a command runs */
         tv.tv_secs = 1;
         tv.tv_micro = 0;
         WaitSelect(gSock + 1, &rd, NULL, NULL, &tv, &mask);
+
+        if (!gHangup && FD_ISSET(gSock, &rd) && !gReadWait.lh_Head->ln_Succ) {
+            unsigned char pb;                   /* readable with nobody waiting: data or EOF */
+            if (recv(gSock, (APTR)&pb, 1, MSG_PEEK) == 0) {
+                logmsg("telnetd: hangup eof, no reader\n", 0);
+                do_hangup();
+            }
+        }
 
         if ((mask & SIGBREAKF_CTRL_C) && !gHangup) {
             PutStr((STRPTR)"telnetd: break - ending session\n");
