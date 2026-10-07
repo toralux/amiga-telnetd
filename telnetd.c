@@ -1,12 +1,11 @@
 /*
  * telnetd.c — a standalone telnet daemon for AmigaOS 2.04+
- * v0.4: session architecture ported from telnetd 2.0 (Peter Simons &
- * Steve Holland, 1995, GPLv2), adapted for AmiTCP_NG 4.x: no inetd, no
- * usergroup.library, one connection at a time, LAN-only.
+ * v0.4: session architecture follows the approach of telnetd 2.0 (Peter
+ * Simons & Steve Holland, 1995), reimplemented for AmiTCP_NG 4.x: no
+ * inetd, no usergroup.library, one connection at a time, LAN-only.
+ * No code from the GPLv2 original is used.
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; version 2 of the License.
+ * Copyright (c) 2026 Tor Anders Johansen. MIT License — see LICENSE.
  *
  * Mechanism:
  *   The daemon owns one PRIVATE handler port (CreateMsgPort) for its whole

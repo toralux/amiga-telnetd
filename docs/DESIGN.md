@@ -1,6 +1,6 @@
 # telnetd v0.4 — Design
 
-Architecture ported from **telnetd 2.0** (Peter Simons & Steve Holland, 1995, GPLv2,
+Architecture follows the approach of **telnetd 2.0** (Peter Simons & Steve Holland, 1995,
 Aminet `comm/tcp/telnetd2_0.lha`): the shell's stdio is a DOS filehandle whose
 handler is a message port served by the daemon, which relays the DosPackets over
 the socket. The fakesr.device path is not used.
@@ -103,4 +103,4 @@ process that opened bsdsocket.library (AmiTCP_NG enforces this per SocketBase).
 
 ## License
 
-GPLv2 (telnetd 2.0 port). Credit: Peter Simons & Steve Holland.
+MIT. Architecture follows the approach of telnetd 2.0 (Simons & Holland) — no code from the GPLv2 original.

@@ -6,10 +6,10 @@ no authentication. One connection at a time, real AmigaDOS shell per
 connection. Needs a bsdsocket TCP/IP stack (AmiTCP, AmiTCP_NG, Roadshow,
 Miami).
 
-**License: GPLv2.** The session architecture (packet-serving filehandle,
-`NewShell *` spawn recipe, ACTION_WAIT_CHAR/SCREEN_MODE handling) is
-ported from **telnetd 2.0** by Peter Simons & Steve Holland (1995,
-GPLv2), adapted for AmiTCP_NG 4.x: no inetd, no usergroup.library, LAN
+**License: MIT.** The session architecture (packet-serving filehandle,
+`NewShell *` spawn recipe, ACTION_WAIT_CHAR/SCREEN_MODE handling) follows the approach of **telnetd 2.0** by Peter Simons & Steve
+Holland (1995), reimplemented for AmiTCP_NG 4.x: no inetd, no
+usergroup.library, LAN
 only. See docs/DESIGN.md for the full architecture and provenance.
 
 ## Run
