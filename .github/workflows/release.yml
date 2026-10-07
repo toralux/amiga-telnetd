@@ -43,7 +43,7 @@ jobs:
           esac
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "release exists - refreshing assets instead of failing"
-            gh release upload "$TAG" telnetd README.md LICENSE --clobber
+            gh release upload "$TAG" telnetd telnetd.020 README.md LICENSE --clobber
           else
-            gh release create "$TAG" --title "telnetd ${GITHUB_REF_NAME#v}" --generate-notes $FLAGS telnetd README.md LICENSE
+            gh release create "$TAG" --title "telnetd ${GITHUB_REF_NAME#v}" --generate-notes $FLAGS telnetd telnetd.020 README.md LICENSE
           fi
