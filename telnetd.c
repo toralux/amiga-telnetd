@@ -73,7 +73,7 @@
 #endif
 
 static const char __attribute__((used)) verstag[] =
-    "$VER: telnetd 0.3 (6.10.2026)";
+    "$VER: telnetd 0.3.1 (6.10.2026)";
 
 /* Telnet protocol bytes */
 #define TEL_IAC      255
@@ -548,11 +548,17 @@ int main(int argc, char **argv)
         struct FileHandle *fh;
         BPTR fhB;
         BOOL clean;
+        /* amiagent pattern: NEVER a NULL timeout with a signal mask here -
+         * the guru (8000 0004, div-by-zero, no session active) hit the
+         * daemon parked in the previous NULL-timeout WaitSelect. */
+        struct timeval tv;
+        memset(&tv, 0, sizeof tv);
+        tv.tv_secs = 2;
 
         FD_ZERO(&rdset);
         FD_SET(gListen, &rdset);
         {
-            LONG selr = WaitSelect(gListen + 1, &rdset, NULL, NULL, NULL, &mask);
+            LONG selr = WaitSelect(gListen + 1, &rdset, NULL, NULL, &tv, &mask);
             if (mask & SIGBREAKF_CTRL_C) { PutStr((STRPTR)"telnetd: break\n"); break; }
             if (selr <= 0) continue;
         }
