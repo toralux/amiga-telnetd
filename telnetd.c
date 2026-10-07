@@ -96,8 +96,25 @@
 #define ACTION_CHANGE_SIGNAL 995
 #endif
 
+#ifndef ACTION_DISK_INFO
+#define ACTION_DISK_INFO 25              /* wiki.amigaos.net: AmigaDOS_Packets */
+#endif
+
+/* Console-flavoured InfoData for ACTION_DISK_INFO (frozen ABI: 9 LONGs). */
+struct td_InfoData {
+    LONG id_NumSoftErrors;
+    LONG id_UnitNumber;
+    LONG id_DiskState;
+    LONG id_NumBlocks;
+    LONG id_NumBlocksUsed;
+    LONG id_BytesPerBlock;
+    LONG id_DiskType;
+    LONG id_VolumeNode;
+    LONG id_InUse;
+};
+
 static const char __attribute__((used)) verstag[] =
-    "$VER: telnetd 0.4.7 (7.10.2026)";
+    "$VER: telnetd 0.4.8 (7.10.2026)";
 
 /* Telnet protocol bytes */
 #define TEL_IAC      255
@@ -118,7 +135,7 @@ static const char __attribute__((used)) verstag[] =
 
 #define IOBUF        1024
 #define MIN_STACK    16000            /* refuse to run on a smaller stack */
-#define DRAIN_SECS   10
+#define DRAIN_SECS   3
 #ifndef MSG_PEEK
 #define MSG_PEEK     2                /* AmiTCP: in case headers lack it */
 #endif               /* after hangup the shell must end by then */
@@ -417,7 +434,7 @@ static void flush_waiters(void)
             stop_timer(pkt);
             reply(pkt, DOSFALSE, 0);
         } else {
-            reply(pkt, pkt->dp_Res1, 0);
+            reply(pkt, DOSFALSE, ERROR_BREAK);  /* READ: break semantics - a plain 0-byte EOF makes the shell re-read forever */
         }
     }
 }
@@ -507,7 +524,7 @@ static void handle_packet(struct Message *msg)
     }
 
     case ACTION_READ:
-        if (!live) { reply(pkt, 0, 0); break; }   /* EOF: 2.0 semantics, no per-packet identity */
+        if (!live) { reply(pkt, DOSFALSE, ERROR_BREAK); break; }   /* break, not bare EOF: the shell exits on it */
         note_reader(pkt);
         pkt->dp_Res1 = 0;
         logmsg("telnetd: read queued\n", 0);
@@ -566,6 +583,17 @@ static void handle_packet(struct Message *msg)
     case ACTION_SEEK:
         reply(pkt, -1, ERROR_OBJECT_WRONG_TYPE);
         break;
+
+    case ACTION_DISK_INFO: {                /* more and friends probe the console */
+        struct td_InfoData *id = (struct td_InfoData *)pkt->dp_Arg1;
+        if (id) {
+            memset(id, 0, sizeof *id);
+            id->id_DiskType = 0x11111111;   /* ID_NO_DISK_PRESENT */
+            id->id_InUse = DOSTRUE;
+        }
+        reply(pkt, DOSTRUE, 0);
+        break;
+    }
 
     case ACTION_IS_FILESYSTEM:
         reply(pkt, DOSFALSE, 0);
@@ -851,7 +879,7 @@ int main(int argc, char **argv)
         if (gOpens > 0) {                     /* zombie shell of last session */
             LONG zw = 0;
             BOOL zbreak = FALSE;
-            while (gOpens > 0 && zw < 15) {
+            while (gOpens > 0 && zw < 3) {
                 struct timeval zt;
                 ULONG zm = SIGBREAKF_CTRL_C;
                 zt.tv_secs = 1;
