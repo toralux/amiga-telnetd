@@ -56,6 +56,8 @@
 #include <errno.h>
 
 #include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
 
 #ifndef NewList
 #define NewList(l)  ((l)->lh_Head = (struct Node *)&(l)->lh_Tail, \
@@ -87,7 +89,26 @@ static const char __attribute__((used)) verstag[] =
 
 #define IOBUF        1024
 
-struct Library *SocketBase = NULL;   /* extern in proto/bsdsocket.h */
+struct Library *SocketBase = NULL;
+
+/* Debug breadcrumbs that SURVIVE a crash: open-append-close per event,
+ * so DOS buffering cannot eat the trail of a suspended daemon. */
+static void dbglog(const char *fmt, ...)
+{
+    char buf[160];
+    va_list ap;
+    BPTR f;
+    LONG len;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    len = (LONG)strlen(buf);
+    f = Open((STRPTR)"Data:tdbg.log", MODE_READWRITE);
+    if (!f) return;
+    Seek(f, 0, OFFSET_END);
+    Write(f, (APTR)buf, len);
+    Close(f);
+}   /* extern in proto/bsdsocket.h */
 static int              gListen   = -1;
 static int              gSock     = -1;
 static int              gBreak    = FALSE;
@@ -243,7 +264,7 @@ static BOOL session_loop(void)
 
         if (mask & SIGBREAKF_CTRL_C) {
             PutStr((STRPTR)"telnetd: break - closing session\n");
-            PutStr((STRPTR)"dbg: ctrl-c in session\n");
+            PutStr((STRPTR)"dbg: ctrl-c in session\n"); dbglog("dbg: ctrl-c in session\n");
             gBreak = TRUE;
             ended = TRUE;
             break;
@@ -316,7 +337,7 @@ static BOOL session_loop(void)
         while ((msg = GetMsg(pktPort)) != NULL) {
             silent = 0;
             pkt = pkt_from_msg(msg);
-            Printf((STRPTR)"dbg: pkt type %ld\n", (LONG)pkt->dp_Type);
+            dbglog("dbg: pkt type %ld\n", (LONG)pkt->dp_Type);
             switch (pkt->dp_Type) {
 
             case ACTION_FINDINPUT:
@@ -404,11 +425,11 @@ static BOOL session_loop(void)
         if (!ended) {
             silent++;
             if (readWait.lh_Head->ln_Succ == NULL && silent > 10 && !hangup) {
-                PutStr((STRPTR)"telnetd: shell produced no session - abandoning\n");
+                PutStr((STRPTR)"telnetd: shell produced no session - abandoning\n"); dbglog("dbg: abandon: no session\n");
                 break;                       /* FALSE: abandoned */
             }
             if (hangup && silent > 5) {
-                PutStr((STRPTR)"telnetd: shell did not end - abandoning\n");
+                PutStr((STRPTR)"telnetd: shell did not end - abandoning\n"); dbglog("dbg: abandon: no end\n");
                 break;                       /* FALSE: abandoned */
             }
         }
@@ -448,26 +469,32 @@ int main(int argc, char **argv)
 
     (void)argc; (void)argv;
 
+    dbglog("dbg: startup: entered main\n");
     rd = ReadArgs((STRPTR)"PORT/N", args, NULL);
     if (rd == NULL) {
         PutStr((STRPTR)"telnetd: bad arguments\n");
         return RETURN_FAIL;
     }
+    dbglog("dbg: startup: ReadArgs ok\n");
     if (args[0]) port = *(ULONG *)args[0];
 
+    dbglog("dbg: startup: opening bsdsocket\n");
     SocketBase = OpenLibrary((STRPTR)"bsdsocket.library", 3);
     if (!SocketBase) {
         PutStr((STRPTR)"telnetd: no bsdsocket.library - is the TCP/IP stack up?\n");
         FreeArgs(rd);
         return RETURN_FAIL;
     }
+    dbglog("dbg: startup: bsdsocket open\n");
 
     /* No DOS requesters may ever park this headless daemon (telnetd 2.0
      * NoReq / amiagent pr_WindowPtr=-1 pattern). */
     self->pr_WindowPtr = (APTR)-1;
 
+    dbglog("dbg: startup: creating socket\n");
     gListen = socket(AF_INET, SOCK_STREAM, 0);
     if (gListen < 0) { PutStr((STRPTR)"telnetd: socket failed\n"); goto out; }
+    dbglog("dbg: startup: socket ok\n");
 
     memset(&sa, 0, sizeof sa);
     sa.sin_family      = AF_INET;
@@ -479,9 +506,12 @@ int main(int argc, char **argv)
         PutStr((STRPTR)"telnetd: bind failed (port in use?)\n");
         goto out;
     }
+    dbglog("dbg: startup: bound\n");
     if (listen(gListen, 1) < 0) { PutStr((STRPTR)"telnetd: listen failed\n"); goto out; }
+    { BPTR f = Open((STRPTR)"Data:tdbg.log", MODE_NEWFILE); if (f) Close(f); }
 
     Printf((STRPTR)"telnetd: listening on port %ld - Ctrl-C stops\n", port);
+    dbglog("dbg: listening on port %ld\n", (LONG)port);
 
     for (;;) {
         fd_set rdset;
@@ -505,10 +535,10 @@ int main(int argc, char **argv)
             gSock = accept(gListen, (struct sockaddr *)&ca, &calen);
         }
         if (gSock < 0) { PutStr((STRPTR)"dbg: accept failed\n"); continue; }
-        PutStr((STRPTR)"dbg: accepted\n");
+        PutStr((STRPTR)"dbg: accepted\n"); dbglog("dbg: accepted\n");
 
         negotiate_start();
-        PutStr((STRPTR)"dbg: negotiated\n");
+        PutStr((STRPTR)"dbg: negotiated\n"); dbglog("dbg: negotiated\n");
 
         /* The session handle: handler = our own pr_MsgPort, unbuffered. */
         fhB = (BPTR)AllocDosObject(DOS_FILEHANDLE, NULL);
@@ -519,10 +549,21 @@ int main(int argc, char **argv)
         fh->fh_Arg1 = (LONG)gSock;
         fh->fh_Pos  = -1;
         fh->fh_End  = -1;
-        PutStr((STRPTR)"dbg: handle ready\n");
+        PutStr((STRPTR)"dbg: handle ready\n"); dbglog("dbg: handle ready\n");
 
+#ifdef BISECT_MINIMAL
+        /* Bisection build: no spawn, no session - just log and close. */
+        {
+            unsigned char discard[64];
+            LONG got = recv(gSock, (APTR)discard, 64, 0);
+            Printf((STRPTR)"bisect: accepted conn, got %ld bytes, closing\n", (LONG)got);
+        }
+        CloseSocket(gSock);
+        gSock = -1;
+        continue;
+#endif
         PutStr((STRPTR)"telnetd: connection - starting shell\n");
-        PutStr((STRPTR)"dbg: calling SystemTags\n");
+        PutStr((STRPTR)"dbg: calling SystemTags\n"); dbglog("dbg: calling SystemTags\n");
         /* The proven telnetd 2.0 spawn: NewShell * on our handle as both
          * stdio and console task, as a CLI process. No SYS_UserShell. */
         if (SystemTags((STRPTR)"NewShell *",
@@ -533,7 +574,7 @@ int main(int argc, char **argv)
                        NP_Cli,         TRUE,
                        NP_StackSize,   65536,
                        TAG_DONE) == -1) {
-            PutStr((STRPTR)"dbg: SystemTags FAILED\n");
+            PutStr((STRPTR)"dbg: SystemTags FAILED\n"); dbglog("dbg: SystemTags FAILED\n");
             PutStr((STRPTR)"telnetd: could not start shell\n");
             Close(fhB);
             while ((msg = GetMsg(&self->pr_MsgPort)) != NULL) {  /* drain END */
@@ -543,7 +584,7 @@ int main(int argc, char **argv)
             continue;
         }
 
-        PutStr((STRPTR)"dbg: spawn ok - entering session loop\n");
+        PutStr((STRPTR)"dbg: spawn ok - entering session loop\n"); dbglog("dbg: spawn ok - entering session loop\n");
 
         /* Stragglers from a previous abandoned shell must not leak in. */
         while ((msg = GetMsg(&self->pr_MsgPort)) != NULL) {
