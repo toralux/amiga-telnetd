@@ -1,6 +1,6 @@
 /*
  * telnetd.c — a standalone telnet daemon for AmigaOS 2.04+
- * v0.2: session architecture ported from telnetd 2.0 (Peter Simons &
+ * v0.4: session architecture ported from telnetd 2.0 (Peter Simons &
  * Steve Holland, 1995, GPLv2), adapted for AmiTCP_NG 4.x: no inetd, no
  * usergroup.library, one connection at a time, LAN-only.
  *
@@ -8,28 +8,45 @@
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation; version 2 of the License.
  *
- * Mechanism (the telnetd 2.0 "star path", proven since 1995):
- *   For each accepted connection the daemon builds a DOS filehandle whose
- *   handler is THIS process's pr_MsgPort (fh_Type/fh_Port), with the
- *   unbuffered sentinels fh_Pos=fh_End=-1. System("NewShell *") is called
- *   asynchronously with that handle as SYS_Input/SYS_Output, NP_Cli, and
- *   NP_ConsoleTask pointed at our port. The shell's stdio then arrives as
- *   DosPackets on pr_MsgPort, which the session loop answers:
- *     ACTION_READ        — queued; completed line-oriented (CR/LF ends it)
- *     ACTION_WRITE       — sent immediately, LF -> CRLF, IAC escaped
- *     ACTION_WAIT_CHAR   — WaitForChar() via timer.device UNIT_MICROHZ
- *     ACTION_SCREEN_MODE — SetMode(): raw/cooked, telnet echo negotiated
- *     ACTION_FIND*       — handle re-wired to this session (opencount++)
- *     ACTION_END         — opencount--; zero ends the session
- *     ACTION_SEEK        — not seekable
- *     default            — ACTION_NOT_KNOWN (v0.1 wrongly used 503)
+ * Mechanism:
+ *   The daemon owns one PRIVATE handler port (CreateMsgPort) for its whole
+ *   life. For each connection it makes two DOS filehandles whose fh_Type
+ *   is that port and runs System("NewShell *", SYS_Asynch) with them as
+ *   stdio and NP_ConsoleTask = the port. The shell's console traffic then
+ *   arrives as DosPackets on the private port and is served here:
+ *     ACTION_FIND*         — "*" opened again: opencount++
+ *     ACTION_READ          — queued; cooked: completed per line,
+ *                            raw: completed with what is available
+ *     ACTION_WRITE         — sent at once, LF -> CRLF, CSI -> ESC [,
+ *                            IAC escaped
+ *     ACTION_WAIT_CHAR     — timer.device UNIT_MICROHZ
+ *     ACTION_SCREEN_MODE   — raw/cooked + telnet ECHO/SGA negotiation
+ *     ACTION_CHANGE_SIGNAL — who gets Ctrl-C
+ *     ACTION_END           — opencount--; zero ends the session
+ *   Every handle carries the session number in fh_Arg1, so packets from a
+ *   process that outlived its session (a "run" job, an abandoned shell)
+ *   are recognised and answered harmlessly: READ gets EOF, WRITE is
+ *   discarded. The port is never freed while anything may still use it.
  *
- * Build (cross toolchain on x64 Linux):
+ * Why a private port (the v0.2-v0.3.1 crashes): telnetd 2.0 serves the
+ * packets on its own pr_MsgPort, which is only legal because that
+ * process makes NO DOS calls of its own after the spawn ("NO more DOS
+ * calls allowed after this one", telnetd.c rev 2.0). pr_MsgPort is where
+ * dos.library waits for the replies to the process's own packets, and
+ * WaitPkt() takes whatever arrives first. Every Open/Write/Close/PutStr
+ * the daemon made while a shell was talking to pr_MsgPort could swallow
+ * a shell packet as its own reply; the real filesystem reply then landed
+ * in the session loop and was "replied" back to the filesystem handler.
+ * With a private port the daemon's own DOS I/O and the shell's console
+ * traffic never meet.
+ *
+ * Build (cross toolchain):
  *   m68k-amigaos-gcc -Os -m68000 -Wall -Wextra -o telnetd telnetd.c -s -lamiga
  *
  * Run:  1> stack 20000
- *       1> telnetd            ; port 23
- *       1> telnetd 2323       ; custom port
+ *       1> telnetd                         ; port 23
+ *       1> telnetd 2323                    ; custom port
+ *       1> telnetd LOG=Data:tdbg.log       ; crash-surviving trace
  * Stop with Ctrl-C in the starting Shell.
  *
  * WARNING: no authentication. LAN use only — never expose to the internet.
@@ -37,6 +54,7 @@
 
 #include <exec/types.h>
 #include <exec/memory.h>
+#include <exec/execbase.h>
 #include <exec/io.h>
 #include <exec/devices.h>
 #include <devices/timer.h>
@@ -51,13 +69,11 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <netinet/in.h>
 #include <proto/bsdsocket.h>
-#include <errno.h>
 
 #include <string.h>
-#include <stdio.h>
-#include <stdarg.h>
 
 #ifndef NewList
 #define NewList(l)  ((l)->lh_Head = (struct Node *)&(l)->lh_Tail, \
@@ -65,15 +81,19 @@
                      (l)->lh_TailPred = (struct Node *)&(l)->lh_Head)
 #endif
 
-#ifndef MKBADDR
-#define MKBADDR(x) ((BPTR)(((ULONG)(x)) >> 2))
-#endif
 #ifndef BADDR
 #define BADDR(x)  ((APTR)(((ULONG)(x)) << 2))
 #endif
+#ifndef MKBADDR
+#define MKBADDR(x) ((BPTR)(((ULONG)(x)) >> 2))
+#endif
+
+#ifndef ACTION_CHANGE_SIGNAL
+#define ACTION_CHANGE_SIGNAL 995
+#endif
 
 static const char __attribute__((used)) verstag[] =
-    "$VER: telnetd 0.3.1 (6.10.2026)";
+    "$VER: telnetd 0.4 (7.10.2026)";
 
 /* Telnet protocol bytes */
 #define TEL_IAC      255
@@ -82,67 +102,111 @@ static const char __attribute__((used)) verstag[] =
 #define TEL_WONT     252
 #define TEL_WILL     251
 #define TEL_SB       250
+#define TEL_IP       244
+#define TEL_BRK      243
 #define TEL_SE       240
 #define OPT_ECHO       1
 #define OPT_SGA        3
-#define OPT_LINEMODE  34
+
+/* bsdsocket errno values (BSD numbering, as returned by Errno()) */
+#define SOCK_EINTR         4
+#define SOCK_EWOULDBLOCK  35
 
 #define IOBUF        1024
+#define MIN_STACK    16000            /* refuse to run on a smaller stack */
+#define DRAIN_SECS   30               /* after hangup the shell must end by then */
+#define SPAWN_SECS   10               /* NewShell must open "*" by then */
 
-struct Library *SocketBase = NULL;
+struct Library *SocketBase = NULL;    /* extern in proto/bsdsocket.h */
 
-/* Debug breadcrumbs that SURVIVE a crash: open-append-close per event,
- * so DOS buffering cannot eat the trail of a suspended daemon. */
-static void dbglog(const char *fmt, ...)
-{
-    char buf[160];
-    va_list ap;
-    BPTR f;
-    LONG len;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof buf, fmt, ap);
-    va_end(ap);
-    len = (LONG)strlen(buf);
-    f = Open((STRPTR)"Data:tdbg.log", MODE_READWRITE);
-    if (!f) return;
-    Seek(f, 0, OFFSET_END);
-    Write(f, (APTR)buf, len);
-    Close(f);
-}   /* extern in proto/bsdsocket.h */
+static STRPTR           gLogName  = NULL;
 static int              gListen   = -1;
 static int              gSock     = -1;
-static int              gBreak    = FALSE;
+static BOOL             gBreak    = FALSE;
 
-/* telnetd 2.0 negotiation strings (screen-mode switches) */
-static const unsigned char NoEcho[] = { TEL_IAC,TEL_WILL,OPT_ECHO, TEL_IAC,TEL_WILL,OPT_SGA, 0 };
-static const unsigned char EchoOn[] = { TEL_IAC,TEL_WONT,OPT_ECHO, TEL_IAC,TEL_WONT,OPT_SGA,
-                                        TEL_IAC,TEL_DONT,OPT_LINEMODE, TEL_IAC,TEL_WONT,OPT_SGA, 0 };
+/* the handler port and its timer port live as long as the daemon */
+static struct MsgPort  *gPort     = NULL;
+static struct MsgPort  *gTimePort = NULL;
+static LONG             gSessions = 0;      /* sessions started so far */
+
+/* per-session state (one session at a time; gCookie 0 = no session) */
+static LONG             gCookie   = 0;      /* fh_Arg1 of this session's handles */
+static struct List      gReadWait;          /* queued READ / WAIT_CHAR messages */
+static LONG             gOpens    = 0;      /* this session's handles not yet ENDed */
+static BOOL             gSawOpen  = FALSE;  /* NewShell has opened "*" */
+static BOOL             gHangup   = FALSE;  /* client gone or daemon stopping */
+static BOOL             gRaw      = FALSE;  /* SetMode(fh, 1) in effect */
+static struct Task     *gBreakTask = NULL;  /* receives Ctrl-C from the client */
+static BOOL             gWill[256];         /* options we currently have WILL'd */
+
+/* input decoding state */
+static unsigned char    gIn[256];
+static LONG             gInHead = 0, gInTail = 0;
+static int              gTelState = 0;      /* 0 data, 1 IAC, 2 option, 3 SB, 4 SB-IAC */
+static int              gTelCmd = 0;
+static BOOL             gLastCR = FALSE;
+static LONG             gPeek = -1;         /* char seen by WAIT_CHAR, not yet read */
 
 
-/* ---------------- socket / telnet helpers (ported from telnetd 2.0) ----- */
+/* ---------------- logging ----------------------------------------------
+ * Only with LOG=<file>. Open-append-close per event so the trail survives
+ * a crash. Safe at any time: the daemon's own pr_MsgPort carries only its
+ * own packets. Formatting is RawDoFmt style (%ld, %lx, %s; LONG args). */
+static void logmsg(const char *fmt, LONG arg)
+{
+    BPTR f;
+    if (!gLogName) return;
+    f = Open(gLogName, MODE_READWRITE);
+    if (!f) return;
+    Seek(f, 0, OFFSET_END);
+    VFPrintf(f, (STRPTR)fmt, (APTR)&arg);
+    Close(f);
+}
 
-static LONG send_all(int s, const unsigned char *p, LONG n)
+static LONG now_secs(void)
+{
+    struct DateStamp ds;
+    DateStamp(&ds);
+    return ds.ds_Days * 86400 + ds.ds_Minute * 60 + ds.ds_Tick / TICKS_PER_SECOND;
+}
+
+
+/* ---------------- socket output ---------------------------------------- */
+
+/* The socket is non-blocking: wait for room (bounded) when it is full. */
+static LONG send_all(const unsigned char *p, LONG n)
 {
     LONG sent = 0;
+    int stalls = 0;
+    if (gSock < 0 || gHangup) return -1;
     while (sent < n) {
-        LONG k = send(s, (APTR)(p + sent), (int)(n - sent), 0);
-        if (k <= 0) return -1;
-        sent += k;
+        LONG k = send(gSock, (APTR)(p + sent), (int)(n - sent), 0);
+        if (k > 0) { sent += k; stalls = 0; continue; }
+        if (k < 0 && (Errno() == SOCK_EWOULDBLOCK || Errno() == SOCK_EINTR)) {
+            fd_set wr;
+            struct timeval tv;
+            ULONG mask = 0;
+            if (++stalls > 30) return -1;        /* 30 s without progress */
+            FD_ZERO(&wr);
+            FD_SET(gSock, &wr);
+            tv.tv_secs = 1;
+            tv.tv_micro = 0;
+            WaitSelect(gSock + 1, NULL, &wr, NULL, &tv, &mask);
+            continue;
+        }
+        return -1;
     }
     return sent;
 }
 
-static void negotiate_start(void)
+static void send_opt(int cmd, int opt)
 {
-    static const unsigned char seq1[] = { TEL_IAC,TEL_WILL,OPT_ECHO };
-    static const unsigned char seq2[] = { TEL_IAC,TEL_WILL,OPT_SGA };
-    static const unsigned char seq3[] = { TEL_IAC,TEL_DONT,OPT_LINEMODE };
-    send_all(gSock, seq1, 3);
-    send_all(gSock, seq2, 3);
-    send_all(gSock, seq3, 3);
+    unsigned char seq[3];
+    seq[0] = TEL_IAC; seq[1] = (unsigned char)cmd; seq[2] = (unsigned char)opt;
+    send_all(seq, 3);
 }
 
-/* Output: bare LF -> CRLF, IAC escaped. Returns 0 ok, -1 send failed. */
+/* Output: bare LF -> CRLF, CSI -> ESC [, IAC escaped. 0 ok, -1 failed. */
 static LONG sock_write(const unsigned char *p, LONG n)
 {
     static unsigned char buf[IOBUF];
@@ -151,335 +215,480 @@ static LONG sock_write(const unsigned char *p, LONG n)
         unsigned char c = p[i];
         if (c == 255) {                       /* IAC escape */
             buf[w++] = 255; buf[w++] = 255;
+        } else if (c == 0x9b) {               /* Amiga CSI -> ANSI ESC [ */
+            buf[w++] = 27; buf[w++] = '[';
         } else if (c == 10 && (i == 0 || p[i-1] != 13)) {
             buf[w++] = 13; buf[w++] = 10;     /* bare LF -> CRLF */
         } else {
             buf[w++] = c;
         }
-        if (w >= IOBUF - 2) { if (send_all(gSock, buf, w) < 0) return -1; w = 0; }
+        if (w >= IOBUF - 2) { if (send_all(buf, w) < 0) return -1; w = 0; }
     }
-    if (w > 0) { if (send_all(gSock, buf, w) < 0) return -1; }
+    if (w > 0) { if (send_all(buf, w) < 0) return -1; }
     return 0;
 }
 
-/* Per-character input with telnet IAC filtering.
- * Returns: 1 = char in *loc, 0 = hangup, -1 = no data right now.
- * Static state: single session at a time. */
-static LONG recv_char(unsigned char *loc)
+
+/* ---------------- Ctrl-C forwarding ------------------------------------ */
+
+static BOOL task_alive(struct Task *t)
 {
-    static int state = 0;        /* 0 normal, 1 IAC, 2 opt-of-cmd, 3 SB, 4 SB-IAC */
-    static int cmd = 0;
-    static unsigned char pushback = 0;
-    static int have_pushback = 0;
+    struct Node *n;
+    BOOL found = FALSE;
+    if (!t) return FALSE;
+    Forbid();
+    for (n = SysBase->TaskWait.lh_Head; n->ln_Succ && !found; n = n->ln_Succ)
+        if ((struct Task *)n == t) found = TRUE;
+    for (n = SysBase->TaskReady.lh_Head; n->ln_Succ && !found; n = n->ln_Succ)
+        if ((struct Task *)n == t) found = TRUE;
+    Permit();
+    return found;
+}
+
+static void send_break(void)
+{
+    if (task_alive(gBreakTask)) Signal(gBreakTask, SIGBREAKF_CTRL_C);
+}
+
+
+/* ---------------- telnet option handling ------------------------------- */
+
+/* We only ever agree to ECHO and SGA, and only in raw mode (cooked mode
+ * leaves echo and line editing to the client, as telnetd 2.0 does).
+ * gWill[] tracks what we have announced, so acknowledgements are never
+ * answered (RFC 854 loop rule). */
+static void answer_option(int cmd, int opt)
+{
+    BOOL want = gRaw && (opt == OPT_ECHO || opt == OPT_SGA);
+    switch (cmd) {
+    case TEL_DO:
+        if (want) { if (!gWill[opt]) { gWill[opt] = TRUE; send_opt(TEL_WILL, opt); } }
+        else      { gWill[opt] = FALSE; send_opt(TEL_WONT, opt); }
+        break;
+    case TEL_DONT:
+        if (gWill[opt]) { gWill[opt] = FALSE; send_opt(TEL_WONT, opt); }
+        break;
+    case TEL_WILL:
+        send_opt(TEL_DONT, opt);              /* we want nothing from the client */
+        break;
+    default:                                  /* WONT: nothing to do */
+        break;
+    }
+}
+
+static void set_mode(BOOL raw)
+{
+    static const int opts[2] = { OPT_ECHO, OPT_SGA };
+    int i;
+    gRaw = raw;
+    for (i = 0; i < 2; i++) {
+        if (raw && !gWill[opts[i]])      { gWill[opts[i]] = TRUE;  send_opt(TEL_WILL, opts[i]); }
+        else if (!raw && gWill[opts[i]]) { gWill[opts[i]] = FALSE; send_opt(TEL_WONT, opts[i]); }
+    }
+}
+
+
+/* ---------------- socket input ----------------------------------------- */
+
+/* One raw byte from the socket. 1 = byte, 0 = hangup, -1 = none right now. */
+static LONG in_byte(unsigned char *c)
+{
+    if (gInHead == gInTail) {
+        LONG n = recv(gSock, (APTR)gIn, sizeof gIn, 0);
+        if (n == 0) return 0;
+        if (n < 0) {
+            LONG e = Errno();
+            return (e == SOCK_EWOULDBLOCK || e == SOCK_EINTR) ? -1 : 0;
+        }
+        gInHead = 0;
+        gInTail = n;
+    }
+    *c = gIn[gInHead++];
+    return 1;
+}
+
+/* One data character with telnet commands removed and NVT line ends
+ * folded (CR LF / CR NUL / bare CR -> '\n' cooked, CR raw).
+ * 1 = char in *loc, 0 = hangup, -1 = none right now. */
+static LONG next_char(unsigned char *loc)
+{
+    unsigned char ch;
+    LONG r;
+
+    if (gPeek >= 0) { *loc = (unsigned char)gPeek; gPeek = -1; return 1; }
 
     for (;;) {
-        unsigned char ch;
-        LONG r;
+        r = in_byte(&ch);
+        if (r <= 0) return r;
 
-        if (have_pushback) { ch = pushback; have_pushback = 0; }
-        else {
-            r = recv(gSock, (APTR)&ch, 1, 0);
-            if (r == 0) return 0;                       /* hangup */
-            if (r < 0) return -1;
-        }
-
-        switch (state) {
+        switch (gTelState) {
         case 0:
-            if (ch == 255) { state = 1; continue; }
-            if (ch == 13) {                             /* CR: swallow CR NUL / CR LF */
-                unsigned char nx;
-                r = recv(gSock, (APTR)&nx, 1, 0);
-                if (r == 1 && nx != 10 && nx != 0) { pushback = nx; have_pushback = 1; }
-                else if (r < 0) return -1;
-                *loc = '\n'; return 1;
+            if (ch == TEL_IAC) { gTelState = 1; continue; }
+            if (gLastCR) {
+                gLastCR = FALSE;
+                if (ch == 10 || ch == 0) continue;
             }
-            *loc = ch; return 1;
-        case 1:                                          /* IAC command byte */
-            if (ch == 255) { *loc = 255; state = 0; return 1; }  /* escaped IAC */
-            if (ch == 250) { state = 3; continue; }     /* SB ... SE */
-            if (ch >= 251) { cmd = ch; state = 2; continue; }
-            state = 0; continue;                        /* other: ignore */
-        case 2: {                                        /* option byte */
-            unsigned char rep[3];
-            rep[0] = 255;
-            if (cmd == TEL_DO && (ch == OPT_ECHO || ch == OPT_SGA)) {
-                rep[1] = TEL_WILL; rep[2] = ch; send_all(gSock, rep, 3);
-            } else if (cmd == TEL_DO) {
-                rep[1] = TEL_WONT; rep[2] = ch; send_all(gSock, rep, 3);
-            } else if (cmd == TEL_WILL) {
-                rep[1] = TEL_DONT; rep[2] = ch; send_all(gSock, rep, 3);
-            }                                            /* DONT/WONT: silence */
-            state = 0; continue;
-        }
-        case 3:                                          /* inside SB */
-            if (ch == 255) state = 4;
+            if (ch == 13) { gLastCR = TRUE; *loc = gRaw ? 13 : 10; return 1; }
+            if (ch == 3) {                     /* Ctrl-C: break the foreground */
+                send_break();
+                if (!gRaw) continue;
+            }
+            *loc = ch;
+            return 1;
+        case 1:                                /* IAC command byte */
+            gTelState = 0;
+            if (ch == TEL_IAC) { gLastCR = FALSE; *loc = 255; return 1; }
+            if (ch == TEL_SB) { gTelState = 3; continue; }
+            if (ch >= TEL_WILL) { gTelCmd = ch; gTelState = 2; continue; }
+            if (ch == TEL_IP || ch == TEL_BRK) send_break();
             continue;
-        case 4:                                          /* SB IAC */
-            state = (ch == 240) ? 0 : 3;                /* SE ends it */
+        case 2:                                /* option byte */
+            gTelState = 0;
+            answer_option(gTelCmd, ch);
+            continue;
+        case 3:                                /* inside SB */
+            if (ch == TEL_IAC) gTelState = 4;
+            continue;
+        default:                               /* SB IAC */
+            gTelState = (ch == TEL_SE) ? 0 : 3;
             continue;
         }
     }
 }
 
 
-/* ---------------- the shell spawner (telnetd 2.0 SubSubProc port) -------
- * 2.0 runs System() SYNCHRONOUSLY inside a dedicated throwaway process -
- * never with SYS_Asynch from the main daemon (that combination is the
- * instrumented crash site: the process died inside SystemTags). The
- * helper gets the filehandle BPTR through NP_Arguments as a decimal
- * string, exactly like 2.0 passes it. */
-static BPTR g_spawnFH = 0;   /* set by main before CreateNewProcTags */
+/* ---------------- packet plumbing -------------------------------------- */
 
-static int spawner_entry(void)
-{
-    struct Library *dosBase;
-    BPTR fh = g_spawnFH;
-    LONG rc;
-
-    dosBase = OpenLibrary((STRPTR)"dos.library", 36);
-    if (!dosBase) return RETURN_FAIL;
-
-    rc = SystemTags((STRPTR)"NewShell *",
-                    SYS_Input,      fh,
-                    SYS_Output,     fh,
-                    NP_ConsoleTask, (LONG)((struct FileHandle *)BADDR(fh))->fh_Type,
-                    NP_Cli,         TRUE,
-                    TAG_DONE);
-    /* not reached until the shell exits; then close and die */
-    Close(fh);
-    CloseLibrary(dosBase);
-    return (int)rc;
-}
-
-/* ---------------- the session loop (the telnetd 2.0 star path) ---------- */
-
-static struct DosPacket *pkt_from_msg(struct Message *msg)
+static struct DosPacket *pkt_of(struct Message *msg)
 {
     return (struct DosPacket *)msg->mn_Node.ln_Name;
 }
 
-/* Serves one connection until the shell ends, the client hangs up, or
- * Ctrl-C. Sets gBreak if the daemon should stop afterwards. */
-static BOOL session_loop(void)
+static void reply(struct DosPacket *pkt, LONG res1, LONG res2)
 {
-    struct Process *me = (struct Process *)FindTask(NULL);
-    struct MsgPort *pktPort = &me->pr_MsgPort;
-    struct MsgPort *timePort = CreateMsgPort();
-    struct List readWait;                    /* queued READ / WAIT_CHAR msgs */
+    pkt->dp_Res1 = res1;
+    pkt->dp_Res2 = res2;
+    PutMsg(pkt->dp_Port, pkt->dp_Link);
+}
+
+/* The process that reads is the one that should get Ctrl-C. */
+static void note_reader(struct DosPacket *pkt)
+{
+    struct MsgPort *p = pkt->dp_Port;
+    if (p && (p->mp_Flags & PF_ACTION) == PA_SIGNAL && p->mp_SigTask)
+        gBreakTask = (struct Task *)p->mp_SigTask;
+}
+
+/* WAIT_CHAR keeps its timerequest in dp_Res2 until it is answered. */
+static void stop_timer(struct DosPacket *pkt)
+{
+    struct timerequest *tr = (struct timerequest *)pkt->dp_Res2;
+    if (tr) {
+        AbortIO((struct IORequest *)tr);
+        WaitIO((struct IORequest *)tr);
+        CloseDevice((struct IORequest *)tr);
+        DeleteIORequest((struct IORequest *)tr);
+        pkt->dp_Res2 = 0;
+    }
+}
+
+/* Answer every queued READ / WAIT_CHAR: READ gets what it has so far
+ * (0 = EOF), WAIT_CHAR gets "no character". */
+static void flush_waiters(void)
+{
     struct Message *msg;
-    struct DosPacket *pkt;
-    LONG nextChar = -1;                      /* pushback char from IAC layer */
-    BOOL hangup = FALSE, ended = FALSE;
-    LONG silent = 0;                         /* seconds without packets     */
-    NewList(&readWait);
+    while ((msg = (struct Message *)RemHead(&gReadWait)) != NULL) {
+        struct DosPacket *pkt = pkt_of(msg);
+        if (pkt->dp_Type == ACTION_WAIT_CHAR) {
+            stop_timer(pkt);
+            reply(pkt, DOSFALSE, 0);
+        } else {
+            reply(pkt, pkt->dp_Res1, 0);
+        }
+    }
+}
 
-    if (!timePort) return FALSE;
+/* Client gone (or daemon stopping): the foreground command gets Ctrl-C and
+ * every pending and future READ gets EOF, so the shell ends by itself and
+ * closes its handles. */
+static void do_hangup(void)
+{
+    if (gHangup) return;
+    gHangup = TRUE;
+    logmsg("telnetd: hangup, %ld handles open\n", gOpens);
+    send_break();
+    flush_waiters();
+}
 
-    while (!ended) {
-        fd_set rd;
-        ULONG mask = (1UL << pktPort->mp_SigBit)
-                   | (1UL << timePort->mp_SigBit)
-                   | SIGBREAKF_CTRL_C;
-        struct timeval tv;
-        memset(&tv, 0, sizeof tv);
-        tv.tv_secs = 1;
-        LONG selr;
+/* Complete queued READ / WAIT_CHAR packets from the socket. */
+static void service_reads(void)
+{
+    struct Message *msg;
+    while (!gHangup && (msg = (struct Message *)gReadWait.lh_Head)->mn_Node.ln_Succ) {
+        struct DosPacket *pkt = pkt_of(msg);
+        unsigned char ch;
+        LONG r;
 
-        FD_ZERO(&rd);
-        if (!hangup && readWait.lh_Head->ln_Succ)
-            FD_SET(gSock, &rd);              /* only read while someone waits */
+        if (pkt->dp_Type == ACTION_WAIT_CHAR) {
+            r = next_char(&ch);
+            if (r == 0) { do_hangup(); return; }
+            if (r < 0) return;
+            gPeek = ch;                        /* the next READ gets it */
+            stop_timer(pkt);
+            Remove(&msg->mn_Node);
+            reply(pkt, DOSTRUE, 0);
+            continue;
+        }
 
-        selr = WaitSelect(gSock + 1, &rd, NULL, NULL, &tv, &mask);
+        /* ACTION_READ: dp_Arg2 = buffer, dp_Arg3 = length, dp_Res1 = filled */
+        for (;;) {
+            if (pkt->dp_Res1 >= pkt->dp_Arg3) break;
+            r = next_char(&ch);
+            if (r == 0) { do_hangup(); return; }
+            if (r < 0) {
+                if (gRaw && pkt->dp_Res1 > 0) break;
+                return;                        /* wait for more input */
+            }
+            if (!gRaw && ch == 0x1c) break;    /* Ctrl-\ = EOF, as on CON: */
+            ((unsigned char *)pkt->dp_Arg2)[pkt->dp_Res1++] = ch;
+            if (!gRaw && ch == '\n') break;
+        }
+        Remove(&msg->mn_Node);
+        reply(pkt, pkt->dp_Res1, 0);
+    }
+}
 
-        if (mask & SIGBREAKF_CTRL_C) {
-            PutStr((STRPTR)"telnetd: break - closing session\n");
-            PutStr((STRPTR)"dbg: ctrl-c in session\n"); dbglog("dbg: ctrl-c in session\n");
-            gBreak = TRUE;
-            ended = TRUE;
+/* Serves one packet from the handler port. Packets from handles of an
+ * earlier session (dp_Arg1 != gCookie) or arriving between sessions are
+ * answered without touching the current connection. */
+static void handle_packet(struct Message *msg)
+{
+    struct DosPacket *pkt = pkt_of(msg);
+    BOOL live = (gCookie != 0 && !gHangup);
+    BOOL mine = (gCookie != 0 && pkt->dp_Arg1 == gCookie);
+
+    switch (pkt->dp_Type) {
+
+    case ACTION_FINDINPUT:
+    case ACTION_FINDOUTPUT:
+    case ACTION_FINDUPDATE: {
+        /* Open("*") by a process whose console task is our port. */
+        struct FileHandle *fh = (struct FileHandle *)BADDR((BPTR)pkt->dp_Arg1);
+        fh->fh_Type = gPort;
+        fh->fh_Port = gPort;                   /* non-zero = interactive */
+        fh->fh_Arg1 = gCookie;                 /* 0 between sessions: a dead handle */
+        if (gCookie) { gOpens++; gSawOpen = TRUE; }
+        reply(pkt, DOSTRUE, 0);
+        break;
+    }
+
+    case ACTION_READ:
+        if (!mine || gHangup) { reply(pkt, 0, 0); break; }   /* EOF */
+        note_reader(pkt);
+        pkt->dp_Res1 = 0;
+        AddTail(&gReadWait, &msg->mn_Node);
+        break;
+
+    case ACTION_WRITE:
+        if (mine && live &&
+            sock_write((const unsigned char *)pkt->dp_Arg2, pkt->dp_Arg3) < 0)
+            do_hangup();
+        reply(pkt, pkt->dp_Arg3, 0);          /* output nobody can see is discarded */
+        break;
+
+    case ACTION_WAIT_CHAR: {                   /* dp_Arg1 = timeout, no cookie */
+        struct timerequest *tr;
+        ULONG us = (ULONG)pkt->dp_Arg1;
+        if (!live) { reply(pkt, DOSFALSE, 0); break; }
+        note_reader(pkt);
+        tr = (struct timerequest *)CreateIORequest(gTimePort, sizeof(struct timerequest));
+        if (!tr || OpenDevice((STRPTR)TIMERNAME, UNIT_MICROHZ, (struct IORequest *)tr, 0)) {
+            if (tr) DeleteIORequest((struct IORequest *)tr);
+            reply(pkt, DOSFALSE, ERROR_NO_FREE_STORE);
             break;
         }
+        tr->tr_node.io_Command = TR_ADDREQUEST;
+        tr->tr_time.tv_secs    = us / 1000000;     /* tv_micro must stay < 1e6 */
+        tr->tr_time.tv_micro   = us % 1000000;
+        tr->tr_node.io_Message.mn_Node.ln_Name = (char *)msg;
+        pkt->dp_Res1 = DOSFALSE;
+        pkt->dp_Res2 = (LONG)tr;
+        SendIO((struct IORequest *)tr);
+        AddTail(&gReadWait, &msg->mn_Node);
+        break;
+    }
 
-        /* socket data available: service the head read request */
-        if (!hangup && selr > 0 && FD_ISSET(gSock, &rd)
-            && readWait.lh_Head->ln_Succ) {
-            msg = (struct Message *)readWait.lh_Head;
-            pkt = pkt_from_msg(msg);
+    case ACTION_SCREEN_MODE:                   /* dp_Arg1 = mode, no cookie */
+        if (live) set_mode(pkt->dp_Arg1 != 0);
+        reply(pkt, DOSTRUE, 0);
+        break;
 
-            if (pkt->dp_Type == ACTION_READ) {
-                unsigned char ch = 0;
-                LONG got = 1;
-                silent = 0;
-                while (pkt->dp_Res1 < pkt->dp_Arg3) {
-                    if (nextChar != -1) { ch = (unsigned char)nextChar; nextChar = -1; }
-                    else { got = recv_char(&ch); }
-                    if (got == 0) { hangup = TRUE; break; }
-                    if (got < 0) break;      /* no more data right now */
-                    *((unsigned char *)pkt->dp_Arg2 + pkt->dp_Res1) = ch;
-                    pkt->dp_Res1++;
-                    if (ch == '\r' || ch == '\n') break;
-                }
-                if (got > 0 &&
-                    (pkt->dp_Res1 == pkt->dp_Arg3 || ch == '\r' || ch == '\n')) {
-                    Remove(msg);
-                    PutMsg(pkt->dp_Port, pkt->dp_Link);
-                }
-            } else if (pkt->dp_Type == ACTION_WAIT_CHAR) {
-                unsigned char ch;
-                LONG got = (nextChar != -1) ? (ch = (unsigned char)nextChar, nextChar = -1, 1)
-                                            : recv_char(&ch);
-                if (got == 0) hangup = TRUE;
-                else if (got > 0) {
-                    struct timerequest *tr = (struct timerequest *)pkt->dp_Res2;
-                    if (tr) {
-                        AbortIO((struct IORequest *)tr);
-                        WaitIO((struct IORequest *)tr);
-                        CloseDevice((struct IORequest *)tr);
-                        DeleteIORequest((struct IORequest *)tr);
-                        pkt->dp_Res2 = 0;
-                    }
-                    nextChar = ch;
-                    pkt->dp_Res1 = DOSTRUE;
-                    Remove(msg);
-                    PutMsg(pkt->dp_Port, pkt->dp_Link);
-                }
-            } else {
-                Remove(msg);                 /* invalid request on the queue */
-            }
+    case ACTION_CHANGE_SIGNAL: {
+        struct MsgPort *np = (struct MsgPort *)pkt->dp_Arg2;
+        if (mine && np && np->mp_SigTask) gBreakTask = (struct Task *)np->mp_SigTask;
+        reply(pkt, DOSTRUE, 0);
+        break;
+    }
+
+    case ACTION_END:
+        reply(pkt, DOSTRUE, 0);
+        if (mine) {
+            gOpens--;
+            logmsg("telnetd: END, %ld handles left\n", gOpens);
+        }
+        break;
+
+    case ACTION_SEEK:
+        reply(pkt, -1, ERROR_OBJECT_WRONG_TYPE);
+        break;
+
+    case ACTION_IS_FILESYSTEM:
+        reply(pkt, DOSFALSE, 0);
+        break;
+
+    default:
+        logmsg("telnetd: unknown packet %ld\n", pkt->dp_Type);
+        reply(pkt, DOSFALSE, ERROR_ACTION_NOT_KNOWN);
+        break;
+    }
+}
+
+static void drain_port(void)
+{
+    struct Message *msg;
+    while ((msg = GetMsg(gPort)) != NULL)
+        handle_packet(msg);
+}
+
+
+/* ---------------- one session ------------------------------------------ */
+
+/* AllocDosObject() returns a plain C pointer, NOT a BPTR (dos_protos.h:
+ * APTR). v0.1.2-v0.3.1 cast it to BPTR and then BADDR()ed it, so every
+ * field below was written to 4x the real address - on a 24-bit 68000 bus
+ * that is anywhere from chip RAM to the CIAs and custom chips. telnetd
+ * 2.0 converts with MKBADDR, as done here. */
+static BPTR make_handle(void)
+{
+    struct FileHandle *fh = (struct FileHandle *)AllocDosObject(DOS_FILEHANDLE, NULL);
+    if (!fh) return 0;
+    fh->fh_Type = gPort;
+    fh->fh_Port = gPort;                       /* non-zero = interactive */
+    fh->fh_Arg1 = gCookie;
+    fh->fh_Pos  = -1;                          /* unbuffered */
+    fh->fh_End  = -1;
+    return MKBADDR(fh);
+}
+
+/* Serves the accepted connection gSock until every handle of the session
+ * is closed (or the shell is given up on). */
+static void run_session(void)
+{
+    BPTR in, out;
+    LONG rc;
+    LONG start = now_secs(), hangupAt = 0;
+    ULONG one = 1;
+
+    gSessions++;
+    gCookie = gSessions;
+    NewList(&gReadWait);
+    gOpens = 0;
+    gSawOpen = FALSE;
+    gHangup = FALSE;
+    gRaw = FALSE;
+    gBreakTask = NULL;
+    memset(gWill, 0, sizeof gWill);
+    gInHead = gInTail = 0;
+    gTelState = 0;
+    gLastCR = FALSE;
+    gPeek = -1;
+
+    IoctlSocket(gSock, FIONBIO, (APTR)&one);
+
+    in  = make_handle();
+    out = make_handle();
+    if (!in || !out) {
+        if (in)  FreeDosObject(DOS_FILEHANDLE, (APTR)BADDR(in));
+        if (out) FreeDosObject(DOS_FILEHANDLE, (APTR)BADDR(out));
+        goto done;
+    }
+
+    /* Two distinct handles: with SYS_Asynch, DOS closes both when the
+     * command ends (one ACTION_END each). NewShell opens "*" on
+     * NP_ConsoleTask = gPort for the interactive shell it starts. */
+    gOpens = 2;
+    logmsg("telnetd: session %ld, spawning shell\n", gCookie);
+    rc = SystemTags((STRPTR)"NewShell *",
+                    SYS_Input,      in,
+                    SYS_Output,     out,
+                    SYS_Asynch,     TRUE,
+                    NP_ConsoleTask, (LONG)gPort,
+                    TAG_DONE);
+    if (rc == -1) {
+        /* On failure the caller still owns the handles (System autodoc). */
+        PutStr((STRPTR)"telnetd: could not start NewShell\n");
+        logmsg("telnetd: SystemTags failed\n", 0);
+        FreeDosObject(DOS_FILEHANDLE, (APTR)BADDR(in));
+        FreeDosObject(DOS_FILEHANDLE, (APTR)BADDR(out));
+        gOpens = 0;
+        goto done;
+    }
+    logmsg("telnetd: shell started\n", 0);
+
+    for (;;) {
+        fd_set rd;
+        struct timeval tv;
+        ULONG mask = (1UL << gPort->mp_SigBit)
+                   | (1UL << gTimePort->mp_SigBit)
+                   | SIGBREAKF_CTRL_C;
+
+        /* Over when every handle is closed - but not before NewShell has
+         * opened "*", or its late FINDINPUT would find no session. */
+        if (gOpens <= 0 && (gSawOpen || now_secs() - start > SPAWN_SECS)) break;
+        if (gHangup) {
+            if (!hangupAt) hangupAt = now_secs();
+            else if (now_secs() - hangupAt > DRAIN_SECS) break;
         }
 
-        /* timer replies: WAIT_CHAR timeouts */
+        FD_ZERO(&rd);
+        if (!gHangup && gReadWait.lh_Head->ln_Succ)
+            FD_SET(gSock, &rd);                 /* only read while someone waits */
+        tv.tv_secs = 1;
+        tv.tv_micro = 0;
+        WaitSelect(gSock + 1, &rd, NULL, NULL, &tv, &mask);
+
+        if ((mask & SIGBREAKF_CTRL_C) && !gHangup) {
+            PutStr((STRPTR)"telnetd: break - ending session\n");
+            gBreak = TRUE;
+            do_hangup();
+        }
+
+        /* WAIT_CHAR timeouts */
         {
             struct timerequest *tr;
-            while ((tr = (struct timerequest *)GetMsg(timePort)) != NULL) {
-                msg = (struct Message *)tr->tr_node.io_Message.mn_Node.ln_Name;
-                pkt = pkt_from_msg(msg);
+            while ((tr = (struct timerequest *)GetMsg(gTimePort)) != NULL) {
+                struct Message *msg = (struct Message *)tr->tr_node.io_Message.mn_Node.ln_Name;
+                struct DosPacket *pkt = pkt_of(msg);
                 CloseDevice((struct IORequest *)tr);
                 DeleteIORequest((struct IORequest *)tr);
-                pkt->dp_Res1 = DOSFALSE;     /* no character in time */
                 pkt->dp_Res2 = 0;
-                Remove(msg);
-                PutMsg(pkt->dp_Port, pkt->dp_Link);
+                Remove(&msg->mn_Node);
+                reply(pkt, DOSFALSE, 0);
             }
         }
 
-        /* DOS packets from the shell */
-        while ((msg = GetMsg(pktPort)) != NULL) {
-            silent = 0;
-            pkt = pkt_from_msg(msg);
-            dbglog("dbg: pkt type %ld\n", (LONG)pkt->dp_Type);
-            switch (pkt->dp_Type) {
-
-            case ACTION_FINDINPUT:
-            case ACTION_FINDOUTPUT:
-            case ACTION_FINDUPDATE: {
-                /* The shell (re)opened its stdio: wire that handle to us. */
-                struct FileHandle *fh = (struct FileHandle *)BADDR((BPTR)pkt->dp_Arg1);
-                if (fh) {
-                    fh->fh_Pos  = -1;
-                    fh->fh_End  = -1;
-                    fh->fh_Type = pktPort;
-                    fh->fh_Port = pktPort;
-                    fh->fh_Arg1 = (LONG)gSock;
-                }
-                pkt->dp_Res1 = DOSTRUE;
-                PutMsg(pkt->dp_Port, pkt->dp_Link);
-                break;
-            }
-
-            case ACTION_READ:
-                pkt->dp_Res1 = 0;
-                AddTail(&readWait, msg);     /* completed when data arrives */
-                break;
-
-            case ACTION_WRITE:
-                if (sock_write((const unsigned char *)pkt->dp_Arg2,
-                               pkt->dp_Arg3) < 0)
-                    hangup = TRUE;
-                pkt->dp_Res1 = pkt->dp_Arg3;
-                PutMsg(pkt->dp_Port, pkt->dp_Link);
-                break;
-
-            case ACTION_WAIT_CHAR: {
-                struct timerequest *tr;
-                pkt->dp_Res1 = DOSFALSE;
-                tr = (struct timerequest *)CreateIORequest(timePort,
-                                                           sizeof(struct timerequest));
-                if (!tr || OpenDevice((STRPTR)"timer.device", UNIT_MICROHZ,
-                                      (struct IORequest *)tr, 0)) {
-                    if (tr) DeleteIORequest((struct IORequest *)tr);
-                    pkt->dp_Res2 = ERROR_NO_FREE_STORE;
-                    PutMsg(pkt->dp_Port, pkt->dp_Link);
-                    break;
-                }
-                tr->tr_node.io_Command = TR_ADDREQUEST;
-                tr->tr_time.tv_micro   = pkt->dp_Arg1;
-                tr->tr_time.tv_secs    = 0;
-                tr->tr_node.io_Message.mn_Node.ln_Name = (char *)msg;
-                pkt->dp_Res2 = (LONG)tr;
-                SendIO((struct IORequest *)tr);
-                AddTail(&readWait, msg);
-                break;
-            }
-
-            case ACTION_SCREEN_MODE:
-                send_all(gSock, pkt->dp_Arg1 ? NoEcho : EchoOn,
-                         pkt->dp_Arg1 ? 6 : 12);
-                pkt->dp_Res1 = DOSFALSE;
-                PutMsg(pkt->dp_Port, pkt->dp_Link);
-                break;
-
-            case ACTION_END:
-                pkt->dp_Res1 = 0;
-                PutMsg(pkt->dp_Port, pkt->dp_Link);
-                ended = TRUE;                /* shell is done */
-                break;
-
-            case ACTION_SEEK:
-                pkt->dp_Res1 = -1;
-                pkt->dp_Res2 = ERROR_OBJECT_WRONG_TYPE;
-                PutMsg(pkt->dp_Port, pkt->dp_Link);
-                break;
-
-            default:
-                pkt->dp_Res1 = DOSFALSE;
-                pkt->dp_Res2 = ERROR_ACTION_NOT_KNOWN;
-                PutMsg(pkt->dp_Port, pkt->dp_Link);
-                break;
-            }
-            if (ended || hangup) break;
-        }
-
-        /* watchdogs: a silent shell 10s after spawn, or a hung-up client
-         * whose shell never sends END, must not park the daemon */
-        if (!ended) {
-            silent++;
-            if (readWait.lh_Head->ln_Succ == NULL && silent > 10 && !hangup) {
-                PutStr((STRPTR)"telnetd: shell produced no session - abandoning\n"); dbglog("dbg: abandon: no session\n");
-                break;                       /* FALSE: abandoned */
-            }
-            if (hangup && silent > 5) {
-                PutStr((STRPTR)"telnetd: shell did not end - abandoning\n"); dbglog("dbg: abandon: no end\n");
-                break;                       /* FALSE: abandoned */
-            }
-        }
+        drain_port();
+        service_reads();
     }
 
-    /* teardown: fail everything still queued */
-    while ((msg = (struct Message *)RemHead(&readWait)) != NULL) {
-        pkt = pkt_from_msg(msg);
-        if (pkt->dp_Type == ACTION_WAIT_CHAR && pkt->dp_Res2) {
-            struct timerequest *tr = (struct timerequest *)pkt->dp_Res2;
-            AbortIO((struct IORequest *)tr);
-            WaitIO((struct IORequest *)tr);
-            CloseDevice((struct IORequest *)tr);
-            DeleteIORequest((struct IORequest *)tr);
-            pkt->dp_Res2 = 0;
-        }
-        pkt->dp_Res1 = (pkt->dp_Type == ACTION_READ) ? 0 : DOSFALSE;
-        PutMsg(pkt->dp_Port, pkt->dp_Link);
+done:
+    gHangup = TRUE;
+    flush_waiters();
+    if (gOpens > 0) {
+        PutStr((STRPTR)"telnetd: shell did not exit - left detached\n");
+        logmsg("telnetd: session %ld left detached\n", gCookie);
     }
-    DeleteMsgPort(timePort);
-    return ended && !gBreak;                 /* clean only via ACTION_END */
+    gCookie = 0;                               /* its packets are stale from now on */
 }
 
 
@@ -491,39 +700,53 @@ int main(int argc, char **argv)
     struct RDArgs *rd;
     struct sockaddr_in sa;
     struct Process *self = (struct Process *)FindTask(NULL);
-    struct Message *msg;
     ULONG port = 23;
+    ULONG stack = (ULONG)self->pr_Task.tc_SPUpper - (ULONG)self->pr_Task.tc_SPLower;
     int one = 1;
     APTR oldwinptr = self->pr_WindowPtr;
 
     (void)argc; (void)argv;
 
-    dbglog("dbg: startup: entered main\n");
-    rd = ReadArgs((STRPTR)"PORT/N", args, NULL);
-    if (rd == NULL) {
-        PutStr((STRPTR)"telnetd: bad arguments\n");
+    if (stack < MIN_STACK) {
+        Printf((STRPTR)"telnetd: stack is %lu bytes, needs %ld - run 'stack 20000' first\n",
+               stack, (LONG)MIN_STACK);
         return RETURN_FAIL;
     }
-    dbglog("dbg: startup: ReadArgs ok\n");
-    if (args[0]) port = *(ULONG *)args[0];
 
-    dbglog("dbg: startup: opening bsdsocket\n");
-    SocketBase = OpenLibrary((STRPTR)"bsdsocket.library", 3);
-    if (!SocketBase) {
-        PutStr((STRPTR)"telnetd: no bsdsocket.library - is the TCP/IP stack up?\n");
+    rd = ReadArgs((STRPTR)"PORT/N,LOG/K", args, NULL);
+    if (rd == NULL) {
+        PutStr((STRPTR)"usage: telnetd [PORT <n>] [LOG <file>]\n");
+        return RETURN_FAIL;
+    }
+    if (args[0]) port = *(ULONG *)args[0];
+    gLogName = (STRPTR)args[1];
+    if (gLogName) {                          /* fresh trace per run */
+        BPTR f = Open(gLogName, MODE_NEWFILE);
+        if (f) Close(f);
+    }
+    logmsg("telnetd: started, stack %ld\n", (LONG)stack);
+
+    gPort = CreateMsgPort();
+    gTimePort = CreateMsgPort();
+    if (!gPort || !gTimePort) {
+        PutStr((STRPTR)"telnetd: out of signals/memory\n");
+        if (gPort) DeleteMsgPort(gPort);
+        if (gTimePort) DeleteMsgPort(gTimePort);
         FreeArgs(rd);
         return RETURN_FAIL;
     }
-    dbglog("dbg: startup: bsdsocket open\n");
 
-    /* No DOS requesters may ever park this headless daemon (telnetd 2.0
-     * NoReq / amiagent pr_WindowPtr=-1 pattern). */
+    SocketBase = OpenLibrary((STRPTR)"bsdsocket.library", 3);
+    if (!SocketBase) {
+        PutStr((STRPTR)"telnetd: no bsdsocket.library - is the TCP/IP stack up?\n");
+        goto out;
+    }
+
+    /* No DOS requesters may ever park this headless daemon. */
     self->pr_WindowPtr = (APTR)-1;
 
-    dbglog("dbg: startup: creating socket\n");
     gListen = socket(AF_INET, SOCK_STREAM, 0);
     if (gListen < 0) { PutStr((STRPTR)"telnetd: socket failed\n"); goto out; }
-    dbglog("dbg: startup: socket ok\n");
 
     memset(&sa, 0, sizeof sa);
     sa.sin_family      = AF_INET;
@@ -535,126 +758,63 @@ int main(int argc, char **argv)
         PutStr((STRPTR)"telnetd: bind failed (port in use?)\n");
         goto out;
     }
-    dbglog("dbg: startup: bound\n");
     if (listen(gListen, 1) < 0) { PutStr((STRPTR)"telnetd: listen failed\n"); goto out; }
-    { BPTR f = Open((STRPTR)"Data:tdbg.log", MODE_NEWFILE); if (f) Close(f); }
 
     Printf((STRPTR)"telnetd: listening on port %ld - Ctrl-C stops\n", port);
-    dbglog("dbg: listening on port %ld\n", (LONG)port);
+    logmsg("telnetd: listening on port %ld\n", (LONG)port);
 
-    for (;;) {
+    while (!gBreak) {
         fd_set rdset;
-        ULONG mask = SIGBREAKF_CTRL_C;
-        struct FileHandle *fh;
-        BPTR fhB;
-        BOOL clean;
-        /* amiagent pattern: NEVER a NULL timeout with a signal mask here -
-         * the guru (8000 0004, div-by-zero, no session active) hit the
-         * daemon parked in the previous NULL-timeout WaitSelect. */
+        ULONG mask = SIGBREAKF_CTRL_C | (1UL << gPort->mp_SigBit);
         struct timeval tv;
-        memset(&tv, 0, sizeof tv);
-        tv.tv_secs = 2;
+        struct sockaddr_in ca;
+        socklen_t calen = sizeof ca;
+        LONG selr;
 
         FD_ZERO(&rdset);
         FD_SET(gListen, &rdset);
-        {
-            LONG selr = WaitSelect(gListen + 1, &rdset, NULL, NULL, &tv, &mask);
-            if (mask & SIGBREAKF_CTRL_C) { PutStr((STRPTR)"telnetd: break\n"); break; }
-            if (selr <= 0) continue;
-        }
-        {
-            struct sockaddr_in ca;
-            socklen_t calen = sizeof ca;   /* REAL buffers: NULL addr/len hits an
-                                       * address error on this stack (the
-                                       * 80000003 crash of v0.1-0.2.1) */
-            gSock = accept(gListen, (struct sockaddr *)&ca, &calen);
-        }
-        if (gSock < 0) { PutStr((STRPTR)"dbg: accept failed\n"); continue; }
-        PutStr((STRPTR)"dbg: accepted\n"); dbglog("dbg: accepted\n");
+        tv.tv_secs = 2;
+        tv.tv_micro = 0;
+        selr = WaitSelect(gListen + 1, &rdset, NULL, NULL, &tv, &mask);
+        drain_port();                        /* stragglers of earlier sessions */
+        if (mask & SIGBREAKF_CTRL_C) break;
+        if (selr <= 0 || !FD_ISSET(gListen, &rdset)) continue;
 
-        negotiate_start();
-        PutStr((STRPTR)"dbg: negotiated\n"); dbglog("dbg: negotiated\n");
+        gSock = accept(gListen, (struct sockaddr *)&ca, &calen);
+        if (gSock < 0) { logmsg("telnetd: accept failed, errno %ld\n", Errno()); continue; }
+        logmsg("telnetd: accepted from %lx\n", (LONG)ca.sin_addr.s_addr);
+        PutStr((STRPTR)"telnetd: connection - starting shell\n");
 
-        /* The session handle: handler = our own pr_MsgPort, unbuffered. */
-        fhB = (BPTR)AllocDosObject(DOS_FILEHANDLE, NULL);
-        if (!fhB) { PutStr((STRPTR)"dbg: no handle\n"); CloseSocket(gSock); gSock = -1; continue; }
-        fh = (struct FileHandle *)BADDR(fhB);
-        fh->fh_Type = &self->pr_MsgPort;
-        fh->fh_Port = &self->pr_MsgPort;      /* interactive flag (by tradition) */
-        fh->fh_Arg1 = (LONG)gSock;
-        fh->fh_Pos  = -1;
-        fh->fh_End  = -1;
-        PutStr((STRPTR)"dbg: handle ready\n"); dbglog("dbg: handle ready\n");
+        run_session();
 
-#ifdef BISECT_MINIMAL
-        /* Bisection build: no spawn, no session - just log and close. */
-        {
-            unsigned char discard[64];
-            LONG got = recv(gSock, (APTR)discard, 64, 0);
-            Printf((STRPTR)"bisect: accepted conn, got %ld bytes, closing\n", (LONG)got);
-        }
         CloseSocket(gSock);
         gSock = -1;
-        continue;
-#endif
-        PutStr((STRPTR)"telnetd: connection - starting shell\n");
-        PutStr((STRPTR)"dbg: calling SystemTags\n"); dbglog("dbg: calling SystemTags\n");
-        /* The proven telnetd 2.0 spawn: NewShell * on our handle as both
-         * stdio and console task, as a CLI process. No SYS_UserShell. */
-        {
-            struct TagItem ptags[5];
-            ptags[0].ti_Tag  = NP_Entry;
-            ptags[0].ti_Data = (LONG)spawner_entry;
-            ptags[1].ti_Tag  = NP_StackSize;
-            ptags[1].ti_Data = 20000;
-            ptags[2].ti_Tag  = NP_Name;
-            ptags[2].ti_Data = (LONG)"telnetd shell";
-            ptags[3].ti_Tag  = TAG_END;
-            ptags[3].ti_Data = 0;
-
-            g_spawnFH = fhB;   /* read by spawner_entry at startup */
-            dbglog("dbg: spawning helper process\n");
-            if (CreateNewProc((struct TagItem *)&ptags) == NULL) {
-                PutStr((STRPTR)"telnetd: could not start shell\n");
-                PutStr((STRPTR)"dbg: CreateNewProc FAILED\n"); dbglog("dbg: CreateNewProc FAILED\n");
-                Close(fhB);
-                while ((msg = GetMsg(&self->pr_MsgPort)) != NULL) {  /* drain END */
-                    struct DosPacket *p = (struct DosPacket *)msg->mn_Node.ln_Name;
-                    PutMsg(p->dp_Port, p->dp_Link);
-                }
-                continue;
-            }
-            dbglog("dbg: helper spawned (synchronous System inside)\n");
-        }
-
-        PutStr((STRPTR)"dbg: spawn ok - entering session loop\n"); dbglog("dbg: spawn ok - entering session loop\n");
-
-        /* Stragglers from a previous abandoned shell must not leak in. */
-        while ((msg = GetMsg(&self->pr_MsgPort)) != NULL) {
-            struct DosPacket *p = (struct DosPacket *)msg->mn_Node.ln_Name;
-            p->dp_Res1 = DOSFALSE;
-            p->dp_Res2 = ERROR_ACTION_NOT_KNOWN;
-            PutMsg(p->dp_Port, p->dp_Link);
-        }
-
-        clean = session_loop();
-        if (clean) {
-            FreeDosObject(DOS_FILEHANDLE, fhB);
-        } else {
-            /* An abandoned shell may still reference the handle: leak the
-             * few bytes rather than free them under its feet. */
-            PutStr((STRPTR)"telnetd: session handle kept (abandoned shell)\n");
-        }
-        if (gSock >= 0) { CloseSocket(gSock); gSock = -1; }
-        if (gBreak) { PutStr((STRPTR)"telnetd: stopped\n"); break; }
-        PutStr((STRPTR)"telnetd: session closed - waiting for next\n");
+        logmsg("telnetd: session closed\n", 0);
+        if (!gBreak) PutStr((STRPTR)"telnetd: session closed - waiting for next\n");
     }
+    PutStr((STRPTR)"telnetd: stopped\n");
 
 out:
     if (gListen >= 0) CloseSocket(gListen);
     if (SocketBase) CloseLibrary(SocketBase);
     self->pr_WindowPtr = oldwinptr;
+
+    drain_port();
+    DeleteMsgPort(gTimePort);                /* no timer is pending outside a session */
+    if (gSessions == 0) {
+        DeleteMsgPort(gPort);
+    } else {
+        /* Processes started from a session (a "run" job, a detached shell)
+         * keep this port as their console task and may PutMsg to it after
+         * we are gone. Leave it allocated but inert: PA_IGNORE queues
+         * without signalling, so a late packet waits forever instead of
+         * crashing the machine on freed memory. */
+        Forbid();
+        gPort->mp_Flags = PA_IGNORE;
+        gPort->mp_SigTask = NULL;
+        Permit();
+        FreeSignal(gPort->mp_SigBit);
+    }
     FreeArgs(rd);
     return RETURN_OK;
 }
-

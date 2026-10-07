@@ -16,21 +16,22 @@ only. See docs/DESIGN.md for the full architecture and provenance.
 
 ```amigados
 1> stack 20000
-1> telnetd            ; port 23
-1> telnetd 2323       ; custom port
+1> telnetd                     ; port 23
+1> telnetd 2323                ; custom port
+1> telnetd LOG=Data:tdbg.log   ; also write a crash-surviving trace
 ```
 
 Then from any machine on the LAN: `telnet <amiga-ip>` and you get an
-AmigaDOS shell. `EndCLI` (or `exit`) closes the session; the daemon waits
-for the next connection. Ctrl-C in the starting Shell stops the daemon —
-between sessions or mid-session.
+AmigaDOS shell. `EndCLI` (or Ctrl-\) closes the session; the daemon waits
+for the next connection. Ctrl-C in the starting Shell stops the daemon,
+between sessions or mid-session (the remote shell gets EOF and ends).
 
-### Do I need `stack 20000`?
+### Stack
 
-Recommended, belt-and-braces. The daemon's large buffers are static (not
-on the stack) and the shell it spawns gets an explicit 64 KB stack of its
-own, so the default 4 KB CLI stack will most likely work — but bsdsocket
-and DOS packet internals on a 68000 are exactly where a snug stack bites.
+telnetd refuses to start on less than 16000 bytes of stack and says so.
+bsdsocket.library calls run on the caller's stack (AmiTCP_NG documents a
+~1.5 KB protocol call depth with no guard) and a 68000 has no MMU to
+catch an overrun, so the default 4 KB Shell stack is not enough margin.
 
 ### Running in the background
 
@@ -47,11 +48,17 @@ With no console there is nothing to Ctrl-C, so stop it from any Shell:
 
 ## Telnet client notes
 
-Minimal negotiation is built in: on connect the daemon asks the client
-for character mode with server echo (WILL ECHO, WILL SGA, DONT LINEMODE)
-and refuses every other option, so stock clients work out of the box.
-Output is translated to NVT CRLF; `SetMode()` (raw mode, e.g. for
-password prompts) is supported with proper echo negotiation.
+In normal (cooked) mode the daemon declines ECHO and SGA, so the client
+echoes and edits the line locally (BSD/inetutils telnet "line by line",
+PuTTY with local echo/editing on "Auto") and sends it on Return, as
+telnetd 2.0 did. When a program calls `SetMode(fh, 1)` (raw mode) the
+daemon announces WILL ECHO + WILL SGA and the client switches to
+character mode; `SetMode(fh, 0)` switches back. Ctrl-C (or the client's
+"interrupt process") sends a break to the command reading the console.
+Output is translated to NVT CRLF and Amiga CSI (0x9B) becomes `ESC [`.
+
+A raw TCP client without telnet negotiation (`nc`) works, but with no
+echo and no line editing.
 
 WARNING: no authentication, no encryption — LAN use only, never
 port-forward. A shell over telnet is total remote access.
