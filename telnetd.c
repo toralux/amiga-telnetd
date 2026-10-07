@@ -73,7 +73,7 @@
 #endif
 
 static const char __attribute__((used)) verstag[] =
-    "$VER: telnetd 0.2.2 (6.10.2026)";
+    "$VER: telnetd 0.3 (6.10.2026)";
 
 /* Telnet protocol bytes */
 #define TEL_IAC      255
@@ -221,6 +221,35 @@ static LONG recv_char(unsigned char *loc)
     }
 }
 
+
+/* ---------------- the shell spawner (telnetd 2.0 SubSubProc port) -------
+ * 2.0 runs System() SYNCHRONOUSLY inside a dedicated throwaway process -
+ * never with SYS_Asynch from the main daemon (that combination is the
+ * instrumented crash site: the process died inside SystemTags). The
+ * helper gets the filehandle BPTR through NP_Arguments as a decimal
+ * string, exactly like 2.0 passes it. */
+static BPTR g_spawnFH = 0;   /* set by main before CreateNewProcTags */
+
+static int spawner_entry(void)
+{
+    struct Library *dosBase;
+    BPTR fh = g_spawnFH;
+    LONG rc;
+
+    dosBase = OpenLibrary((STRPTR)"dos.library", 36);
+    if (!dosBase) return RETURN_FAIL;
+
+    rc = SystemTags((STRPTR)"NewShell *",
+                    SYS_Input,      fh,
+                    SYS_Output,     fh,
+                    NP_ConsoleTask, (LONG)((struct FileHandle *)BADDR(fh))->fh_Type,
+                    NP_Cli,         TRUE,
+                    TAG_DONE);
+    /* not reached until the shell exits; then close and die */
+    Close(fh);
+    CloseLibrary(dosBase);
+    return (int)rc;
+}
 
 /* ---------------- the session loop (the telnetd 2.0 star path) ---------- */
 
@@ -566,22 +595,30 @@ int main(int argc, char **argv)
         PutStr((STRPTR)"dbg: calling SystemTags\n"); dbglog("dbg: calling SystemTags\n");
         /* The proven telnetd 2.0 spawn: NewShell * on our handle as both
          * stdio and console task, as a CLI process. No SYS_UserShell. */
-        if (SystemTags((STRPTR)"NewShell *",
-                       SYS_Input,      fhB,
-                       SYS_Output,     fhB,
-                       SYS_Asynch,     TRUE,
-                       NP_ConsoleTask, &self->pr_MsgPort,
-                       NP_Cli,         TRUE,
-                       NP_StackSize,   65536,
-                       TAG_DONE) == -1) {
-            PutStr((STRPTR)"dbg: SystemTags FAILED\n"); dbglog("dbg: SystemTags FAILED\n");
-            PutStr((STRPTR)"telnetd: could not start shell\n");
-            Close(fhB);
-            while ((msg = GetMsg(&self->pr_MsgPort)) != NULL) {  /* drain END */
-                struct DosPacket *p = (struct DosPacket *)msg->mn_Node.ln_Name;
-                PutMsg(p->dp_Port, p->dp_Link);
+        {
+            struct TagItem ptags[5];
+            ptags[0].ti_Tag  = NP_Entry;
+            ptags[0].ti_Data = (LONG)spawner_entry;
+            ptags[1].ti_Tag  = NP_StackSize;
+            ptags[1].ti_Data = 20000;
+            ptags[2].ti_Tag  = NP_Name;
+            ptags[2].ti_Data = (LONG)"telnetd shell";
+            ptags[3].ti_Tag  = TAG_END;
+            ptags[3].ti_Data = 0;
+
+            g_spawnFH = fhB;   /* read by spawner_entry at startup */
+            dbglog("dbg: spawning helper process\n");
+            if (CreateNewProc((struct TagItem *)&ptags) == NULL) {
+                PutStr((STRPTR)"telnetd: could not start shell\n");
+                PutStr((STRPTR)"dbg: CreateNewProc FAILED\n"); dbglog("dbg: CreateNewProc FAILED\n");
+                Close(fhB);
+                while ((msg = GetMsg(&self->pr_MsgPort)) != NULL) {  /* drain END */
+                    struct DosPacket *p = (struct DosPacket *)msg->mn_Node.ln_Name;
+                    PutMsg(p->dp_Port, p->dp_Link);
+                }
+                continue;
             }
-            continue;
+            dbglog("dbg: helper spawned (synchronous System inside)\n");
         }
 
         PutStr((STRPTR)"dbg: spawn ok - entering session loop\n"); dbglog("dbg: spawn ok - entering session loop\n");
