@@ -97,7 +97,7 @@
 #endif
 
 static const char __attribute__((used)) verstag[] =
-    "$VER: telnetd 0.4.4 (7.10.2026)";
+    "$VER: telnetd 0.4.6 (7.10.2026)";
 
 /* Telnet protocol bytes */
 #define TEL_IAC      255
@@ -186,22 +186,24 @@ static LONG send_all(const unsigned char *p, LONG n)
     while (sent < n) {
         LONG k = send(gSock, (APTR)(p + sent), (int)(n - sent), 0);
         if (k > 0) { sent += k; stalls = 0; continue; }
-        if (k < 0) { LONG se = Errno(); logmsg("telnetd: sendfail k %ld\n", k); logmsg("telnetd: sendfail e %ld\n", se); if (se != SOCK_EWOULDBLOCK && se != SOCK_EINTR) return -1; }
-        else if (k < 0) { return -1; }
-        if (k == 0) return -1;
-        if (k < 0 && (0)) {
-            fd_set wr;
-            struct timeval tv;
-            ULONG mask = 0;
+        if (k < 0) {
+            LONG se = Errno();
+            logmsg("telnetd: sendfail e %ld\n", se);
+            if (se != SOCK_EWOULDBLOCK && se != 35 && se != SOCK_EINTR) return -1;
             if (++stalls > 30) return -1;        /* 30 s without progress */
-            FD_ZERO(&wr);
-            FD_SET(gSock, &wr);
-            tv.tv_secs = 1;
-            tv.tv_micro = 0;
-            WaitSelect(gSock + 1, NULL, &wr, NULL, &tv, &mask);
+            {
+                fd_set wr;
+                struct timeval tv;
+                ULONG wmask = 0;
+                FD_ZERO(&wr);
+                FD_SET(gSock, &wr);
+                tv.tv_secs = 1;
+                tv.tv_micro = 0;
+                WaitSelect(gSock + 1, NULL, &wr, NULL, &tv, &wmask);
+            }
             continue;
         }
-        return -1;
+        return -1;                               /* k == 0 */
     }
     return sent;
 }
@@ -303,10 +305,11 @@ static LONG in_byte(unsigned char *c)
     if (gInHead == gInTail) {
         LONG n = recv(gSock, (APTR)gIn, sizeof gIn, 0);
         if (n > 0) logmsg("telnetd: recv %ld\n", n);
-        if (n == 0) return 0;
+        if (n == 0) { logmsg("telnetd: recv eof\n", 0); return 0; }
         if (n < 0) {
             LONG e = Errno();
-            return (e == SOCK_EWOULDBLOCK || e == SOCK_EINTR) ? -1 : 0;
+            logmsg("telnetd: recv err %ld\n", e);
+            return (e == SOCK_EWOULDBLOCK || e == 35 || e == SOCK_EINTR) ? -1 : 0;
         }
         gInHead = 0;
         gInTail = n;
@@ -439,7 +442,7 @@ static void service_reads(void)
 
         if (pkt->dp_Type == ACTION_WAIT_CHAR) {
             r = next_char(&ch);
-            if (r == 0) { logmsg("telnetd: hangup read eof\n", 0); do_hangup(); return; }
+            if (r == 0) { logmsg("telnetd: hangup wait eof\n", 0); do_hangup(); return; }
             if (r < 0) return;
             gPeek = ch;                        /* the next READ gets it */
             stop_timer(pkt);
@@ -834,6 +837,24 @@ int main(int argc, char **argv)
         drain_port();                        /* stragglers of earlier sessions */
         if (mask & SIGBREAKF_CTRL_C) break;
         if (selr <= 0 || !FD_ISSET(gListen, &rdset)) continue;
+
+        if (gOpens > 0) {                     /* zombie shell of last session */
+            LONG zw = 0;
+            BOOL zbreak = FALSE;
+            while (gOpens > 0 && zw < 15) {
+                struct timeval zt;
+                ULONG zm = SIGBREAKF_CTRL_C;
+                zt.tv_secs = 1;
+                zt.tv_micro = 0;
+                WaitSelect(0, NULL, NULL, NULL, &zt, &zm);
+                drain_port();
+                zw++;
+                if (zm & SIGBREAKF_CTRL_C) { zbreak = TRUE; break; }
+            }
+            if (gOpens <= 0) logmsg("telnetd: zombie drained\n", 0);
+            else logmsg("telnetd: zombie stuck, handles %ld\n", (LONG)gOpens);
+            if (zbreak) break;
+        }
 
         gSock = accept(gListen, (struct sockaddr *)&ca, &calen);
         if (gSock < 0) { logmsg("telnetd: accept failed, errno %ld\n", Errno()); continue; }
