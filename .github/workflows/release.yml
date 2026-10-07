@@ -32,7 +32,7 @@ jobs:
           echo "cookie=$VER  tag=$TAGVER"
           test "$VER" = "$TAGVER" || { echo "::error::tag $TAGFULL does not match the \$VER cookie $VER - bump the verstag in telnetd.c first"; exit 1; }
 
-      - name: Create release with the binary
+      - name: Create or update release with the binary
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -41,4 +41,9 @@ jobs:
             *-*) FLAGS="--prerelease" ;;   # v0.1-pre1, v0.1-rc2, ...
             *)  FLAGS="" ;;                # v0.1 -> full release
           esac
-          gh release create "$TAG" --title "telnetd ${GITHUB_REF_NAME#v}" --generate-notes $FLAGS telnetd README.md LICENSE
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release exists - refreshing assets instead of failing"
+            gh release upload "$TAG" telnetd README.md LICENSE --clobber
+          else
+            gh release create "$TAG" --title "telnetd ${GITHUB_REF_NAME#v}" --generate-notes $FLAGS telnetd README.md LICENSE
+          fi
