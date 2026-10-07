@@ -45,7 +45,7 @@
  * Run:  1> stack 20000
  *       1> telnetd                         ; port 23
  *       1> telnetd 2323                    ; custom port
- *       1> telnetd LOG=Data:tdbg.log       ; crash-surviving trace
+ *       1> telnetd LOG=T:tdbg.log            ; crash-surviving trace (any path)
  * Stop with Ctrl-C in the starting Shell.
  *
  * WARNING: no authentication. LAN use only — never expose to the internet.

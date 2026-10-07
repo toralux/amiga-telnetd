@@ -18,7 +18,7 @@ only. See docs/DESIGN.md for the full architecture and provenance.
 1> stack 20000
 1> telnetd                     ; port 23
 1> telnetd 2323                ; custom port
-1> telnetd LOG=Data:tdbg.log   ; also write a crash-surviving trace
+1> telnetd LOG=T:tdbg.log          ; also write a crash-surviving trace (any path)
 ```
 
 Then from any machine on the LAN: `telnet <amiga-ip>` and you get an
