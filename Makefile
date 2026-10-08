@@ -14,7 +14,21 @@ telnetd: telnetd.c
 telnetd.020: telnetd.c
 	$(CC) -Os -fomit-frame-pointer -m68020-60 -Wall -Wextra -o $@ telnetd.c $(LDFLAGS)
 
-clean:
-	rm -f telnetd telnetd.020
+# Host-side test of the input decoder and line editor (no Amiga needed):
+# the portable section of telnetd.c is extracted and compiled against the
+# stubs and terminal model in tests/edtest.c with the host's cc.
+HOSTCC   ?= cc
+SANITIZE ?= -fsanitize=address,undefined
 
-.PHONY: all clean
+test: tests/edtest
+	./tests/edtest
+
+tests/edtest: tests/edtest.c telnetd.c
+	awk '/=== BEGIN portable input\/editor section/{p=1} /=== END portable input\/editor section/{p=0} p' telnetd.c > tests/editor_part.c
+	$(HOSTCC) -Wall -Wextra -Wno-unused-function -g $(SANITIZE) -o $@ tests/edtest.c
+
+clean:
+	rm -f telnetd telnetd.020 tests/edtest tests/editor_part.c
+	rm -rf tests/edtest.dSYM
+
+.PHONY: all clean test

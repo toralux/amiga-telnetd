@@ -18,7 +18,8 @@ only. See docs/DESIGN.md for the full architecture and provenance.
 1> stack 20000
 1> telnetd                     ; port 23
 1> telnetd 2323                ; custom port
-1> telnetd LOG=T:tdbg.log          ; also write a crash-surviving trace (any path)
+1> telnetd LOG=T:tdbg.log      ; also write a crash-surviving trace (any path)
+1> telnetd DUMBTERM            ; for clients without ANSI support (see below)
 ```
 
 Then from any machine on the LAN: `telnet <amiga-ip>` and you get an
@@ -48,17 +49,41 @@ With no console there is nothing to Ctrl-C, so stop it from any Shell:
 
 ## Telnet client notes
 
-In normal (cooked) mode the daemon declines ECHO and SGA, so the client
-echoes and edits the line locally (BSD/inetutils telnet "line by line",
-PuTTY with local echo/editing on "Auto") and sends it on Return, as
-telnetd 2.0 did. When a program calls `SetMode(fh, 1)` (raw mode) the
-daemon announces WILL ECHO + WILL SGA and the client switches to
-character mode; `SetMode(fh, 0)` switches back. Ctrl-C (or the client's
-"interrupt process") sends a break to the command reading the console.
-Output is translated to NVT CRLF and Amiga CSI (0x9B) becomes `ESC [`.
+The daemon puts the client in character mode with server echo (WILL ECHO,
+WILL SGA) and plays the console itself, as CON: does on a real Amiga: in
+normal (cooked) mode it echoes and edits the line and keeps a command
+history, then hands the finished line to the shell. Keys:
 
-A raw TCP client without telnet negotiation (`nc`) works, but with no
-echo and no line editing.
+- Up / Down: history (16 lines per session); Left / Right: move in the line
+- Home / End, Delete, Backspace
+- Ctrl-X or Ctrl-U: kill line; Ctrl-K: kill to end of line
+- Ctrl-C (or the client's "interrupt process"): break the running command;
+  Ctrl-D / Ctrl-E / Ctrl-F send the other Amiga break signals
+- Ctrl-\ on an empty line: EOF
+
+Lines longer than the window wrap correctly: the daemon asks the client for
+its window size (telnet NAWS) and follows resizes; a client that does not
+say is assumed to be 80 columns wide. If a command prints while you are
+typing ahead, your half-typed line is taken off the screen and drawn again
+below the output.
+
+When a program calls `SetMode(fh, 1)` (raw mode) keystrokes go to it
+unedited and unechoed, as with a RAW: console. Output is translated to NVT
+CRLF and Amiga CSI (0x9B) becomes `ESC [`.
+
+Any ANSI/VT100 terminal works (macOS Terminal, iTerm2, PuTTY, xterm) with a
+real telnet client. macOS no longer ships one: `brew install telnet`.
+
+### DUMBTERM: clients without ANSI support
+
+The line editor draws with ANSI escape sequences (cursor left/right/up/down,
+erase to end of line/screen). For a client whose terminal does not
+understand them — a hardware terminal, a very old telnet program, or `nc`,
+which is not a telnet client and never switches to character mode — start
+the daemon with `DUMBTERM`. The client then edits each line itself and
+sends it whole (telnet line mode, local echo), as telnetd 2.0 did: only
+plain text is ever sent to it, and there is no command history or cursor
+key editing. Raw mode works as before.
 
 WARNING: no authentication, no encryption — LAN use only, never
 port-forward. A shell over telnet is total remote access.

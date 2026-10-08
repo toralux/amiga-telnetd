@@ -1,2 +1,5 @@
 telnetd
-telnetd-bisect
+telnetd.020
+tests/edtest
+tests/editor_part.c
+tests/edtest.dSYM/

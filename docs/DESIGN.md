@@ -74,24 +74,43 @@ Red herrings from the earlier investigation:
 2. **Accept loop.** `WaitSelect` on the listener with a 2 s timeout, Ctrl-C and
    the handler-port signal. Packets from processes that outlived their session
    are answered here: READ gets EOF, WRITE is discarded.
-3. **Session.** Make the socket non-blocking (FIONBIO). Allocate two
-   filehandles (`AllocDosObject` → `MKBADDR`) with `fh_Type` = handler port,
-   `fh_Port` non-zero (interactive), `fh_Pos = fh_End = -1`, and
-   `fh_Arg1` = session number. Then:
-   `SystemTags("NewShell *", SYS_Input=in, SYS_Output=out, SYS_Asynch, NP_ConsoleTask=port)`.
-   This is safe from the daemon itself now that its `pr_MsgPort` is not the
-   handler port, and DOS closes both handles when the command ends. NewShell
-   opens `*`, and those FIND packets go to the console task, our port.
+3. **Session.** Make the socket non-blocking (FIONBIO) and put the client in
+   character mode (WILL ECHO, WILL SGA). Allocate two filehandles
+   (`AllocDosObject` → `MKBADDR`) with `fh_Type` = handler port, `fh_Port`
+   non-zero (interactive), `fh_Pos = fh_End = -1`. A short-lived helper process
+   runs `SystemTags("NewShell *", SYS_Input=in, SYS_Output=out,
+   NP_ConsoleTask=port, NP_Cli)` synchronously, then closes both handles
+   (`Forbid(); Close(); Close()`, as telnetd 2.0 does: synchronous System()
+   does not close them). Calling `SystemTags(SYS_Asynch)` from the daemon
+   itself hung on hardware (v0.4). NewShell opens `*`, and those FIND packets
+   go to the console task, our port.
 4. **Packet loop.** It serves FIND*/READ/WRITE/WAIT_CHAR/SCREEN_MODE/
-   CHANGE_SIGNAL/END/SEEK/IS_FILESYSTEM. Handles are counted, and the session
-   ends when the count reaches zero (only after NewShell has opened `*`, so a
-   late FIND cannot miss the session). A packet whose `dp_Arg1` does not match
-   the current session number belongs to an earlier session and is answered
-   harmlessly.
+   CHANGE_SIGNAL/END/SEEK/DISK_INFO/IS_FILESYSTEM. Handles are counted, and
+   the session ends when the count reaches zero (only after NewShell has
+   opened `*`, so a late FIND cannot miss the session). In cooked mode the
+   daemon is the line editor (echo, cursor keys, 16-line history), as CON: is
+   on a real Amiga; raw mode passes keys through. The editor learns the
+   window width with telnet NAWS and follows the client's cursor column
+   through everything it sends, so wrapped lines and typeahead during
+   command output are drawn correctly. `DUMBTERM` turns the editor off for
+   non-ANSI clients: they edit lines themselves (telnet line mode). The
+   editor and input decoder are tested on the host (`make test`,
+   tests/edtest.c). One timer.device request,
+   opened at startup, times every pending WaitForChar.
+
+   Packets are not matched to sessions individually: while a session is live,
+   everything on the port is served as that session's (telnetd 2.0 does the
+   same). A v0.4 check of `dp_Arg1` against a per-session cookie failed on
+   hardware for reasons never established, and was dropped in v0.4.3. A
+   leftover process from an earlier session that is still using the console
+   is therefore treated as part of the new session, and its END can end the
+   new session early. The zombie gate in the accept loop waits for leftover
+   handles to close first, which makes this rare.
 5. **Hangup or Ctrl-C.** Signal Ctrl-C to the reading process. Answer every
-   queued and future READ with EOF, so the shell ends by itself, and wait up to
-   30 s for the handles to close. A shell that does not end is left detached.
-   Its packets keep being answered as stale.
+   queued and future READ with break (0 bytes, `ERROR_BREAK`), so the shell
+   ends by itself, and wait up to 3 s for the handles to close. A shell that
+   does not end is left detached; its packets are answered harmlessly once
+   the session is over.
 6. **Exit.** If any session ran, the handler port is left allocated with
    `PA_IGNORE` and its signal freed. A process that still has it as console
    task then blocks on a late packet, which is better than writing into freed
