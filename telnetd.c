@@ -1158,9 +1158,13 @@ static void handle_packet(struct MsgPort *port, struct Message *msg)
          * write 36 bytes at a quarter of the real address. */
         struct td_InfoData *id = (struct td_InfoData *)BADDR((BPTR)pkt->dp_Arg1);
         if (id) {
+            /* All NULL/zero is the documented safe answer for a console
+             * without a window: ID_VolumeNode would hold the Intuition
+             * Window pointer and ID_InUse the console io-request pointer
+             * (AmigaDOS_Packets wiki); tools NULL-check both (AUX: rule).
+             * A non-pointer value there (DOSTRUE!) is dereferenced by
+             * pagers such as More for screen dimensions -> 80000003. */
             memset(id, 0, sizeof *id);
-            id->id_DiskType = ID_NO_DISK_PRESENT;
-            id->id_InUse = DOSTRUE;
         }
         reply(pkt, DOSTRUE, 0);
         break;
