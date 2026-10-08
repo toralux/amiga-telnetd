@@ -109,7 +109,7 @@
 #endif
 
 static const char __attribute__((used)) verstag[] =
-    "$VER: telnetd 0.5 (8.10.2026)";
+    "$VER: telnetd 0.5.0 (8.10.2026)";
 
 #define MIN_STACK    16000            /* refuse to run on a smaller stack */
 #define EXIT_SECS    5                /* on Ctrl-C: time for hung-up shells to end */
