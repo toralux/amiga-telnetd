@@ -65,25 +65,26 @@ Red herrings from the earlier investigation:
 - The NULL-timeout `WaitSelect`. It is handled in `amiga_generic.c`.
 - 68020 opcodes. Both binaries are 68000-clean by disassembly.
 
-## v0.4 architecture (one process)
+## v0.4 architecture (one process, one session at a time)
 
 1. **Startup.** Refuse to run on less than 16000 bytes of stack. bsdsocket
    calls run on the caller's stack, and a 68000 has no MMU to catch an overrun.
-   Then create **one private handler port** (`CreateMsgPort`) and a timer port,
-   both for the daemon's lifetime.
+   Allocate one signal shared by all handler ports, and a timer port with one
+   timer.device request for every WaitForChar.
 2. **Accept loop.** `WaitSelect` on the listener with a 2 s timeout, Ctrl-C and
-   the handler-port signal. Packets from processes that outlived their session
-   are answered here: READ gets EOF, WRITE is discarded.
+   the handler-port signal. Packets on retired ports (below) are answered
+   here: READ gets break/EOF, WRITE is discarded.
 3. **Session.** Make the socket non-blocking (FIONBIO) and put the client in
    character mode (WILL ECHO, WILL SGA). Allocate two filehandles
-   (`AllocDosObject` → `MKBADDR`) with `fh_Type` = handler port, `fh_Port`
+   (`AllocDosObject` → `MKBADDR`) with `fh_Type` = the session's own handler
+   port (a retired one with no handles left on it, or a new one), `fh_Port`
    non-zero (interactive), `fh_Pos = fh_End = -1`. A short-lived helper process
    runs `SystemTags("NewShell *", SYS_Input=in, SYS_Output=out,
    NP_ConsoleTask=port, NP_Cli)` synchronously, then closes both handles
    (`Forbid(); Close(); Close()`, as telnetd 2.0 does: synchronous System()
    does not close them). Calling `SystemTags(SYS_Asynch)` from the daemon
    itself hung on hardware (v0.4). NewShell opens `*`, and those FIND packets
-   go to the console task, our port.
+   go to the console task, the session's port.
 4. **Packet loop.** It serves FIND*/READ/WRITE/WAIT_CHAR/SCREEN_MODE/
    CHANGE_SIGNAL/END/SEEK/DISK_INFO/IS_FILESYSTEM. Handles are counted, and
    the session ends when the count reaches zero (only after NewShell has
@@ -98,23 +99,22 @@ Red herrings from the earlier investigation:
    tests/edtest.c). One timer.device request,
    opened at startup, times every pending WaitForChar.
 
-   Packets are not matched to sessions individually: while a session is live,
-   everything on the port is served as that session's (telnetd 2.0 does the
-   same). A v0.4 check of `dp_Arg1` against a per-session cookie failed on
-   hardware for reasons never established, and was dropped in v0.4.3. A
-   leftover process from an earlier session that is still using the console
-   is therefore treated as part of the new session, and its END can end the
-   new session early. The zombie gate in the accept loop waits for leftover
-   handles to close first, which makes this rare.
-5. **Hangup or Ctrl-C.** Signal Ctrl-C to the reading process. Answer every
-   queued and future READ with break (0 bytes, `ERROR_BREAK`), so the shell
-   ends by itself, and wait up to 3 s for the handles to close. A shell that
-   does not end is left detached; its packets are answered harmlessly once
-   the session is over.
-6. **Exit.** If any session ran, the handler port is left allocated with
-   `PA_IGNORE` and its signal freed. A process that still has it as console
-   task then blocks on a late packet, which is better than writing into freed
-   memory.
+   A packet's session is the port it arrives on, so a process left over
+   from an earlier session can never be taken for the current one.
+5. **Hangup or Ctrl-C.** Signal Ctrl-C to the reading process and answer
+   every queued READ with break (0 bytes, `ERROR_BREAK`), so the shell ends
+   by itself - then end the session at once, without waiting for it: the
+   port is retired with the number of handles still open on it. A retired
+   port keeps answering (READ break/EOF, WRITE discarded, FIND/END counted on
+   the port) and is reused only once no handle is left on it, so a shell
+   that never reacts (a command that ignores Ctrl-C and never reads) costs
+   one port and delays nobody: the next client is served at once.
+6. **Exit.** Ctrl-C ends the session as above, then waits (still answering
+   packets) up to 5 s for hung-up shells to end, and with no time limit for
+   the spawn helper: it runs code in the daemon's seglist, which must not be
+   unloaded under it. Every port is left allocated with `PA_IGNORE`: a
+   process that still has one as console task then blocks on a late packet,
+   which is better than writing into freed memory.
 
 All DOS I/O of the daemon itself (`PutStr`, `LOG=` trace) goes through its own
 `pr_MsgPort` and can no longer meet shell traffic. All socket calls stay in the

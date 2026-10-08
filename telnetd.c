@@ -9,8 +9,8 @@
  * Copyright (c) 2026 Tor Anders Johansen. MIT License — see LICENSE.
  *
  * Mechanism:
- *   The daemon owns one PRIVATE handler port (CreateMsgPort) for its whole
- *   life. For each connection it makes two DOS filehandles whose fh_Type
+ *   Each session gets a PRIVATE handler port (all on one shared signal).
+ *   For the connection the daemon makes two DOS filehandles whose fh_Type
  *   is that port, then a short-lived helper process runs SystemTags(
  *   "NewShell *") synchronously with them as stdio and NP_ConsoleTask =
  *   the port, and closes them when NewShell returns. The interactive
@@ -26,11 +26,13 @@
  *     ACTION_SCREEN_MODE   — raw/cooked + telnet ECHO/SGA negotiation
  *     ACTION_CHANGE_SIGNAL — who gets Ctrl-C
  *     ACTION_END           — opencount--; zero ends the session
- *   Between sessions every packet is answered harmlessly (READ gets
- *   break/EOF, WRITE is discarded), so a process that outlived its
- *   session (a "run" job, an abandoned shell) cannot hurt the daemon.
- *   While a session is live its packets are served as the session's own.
- *   The port is never freed while anything may still use it.
+ *   A packet's session is the port it arrives on. When a session ends its
+ *   port is retired, not freed: retired ports are still served - READ gets
+ *   break/EOF, WRITE is discarded - and count the handles still open on
+ *   them, so a shell that outlives its client (a command that ignores
+ *   Ctrl-C) or a "run" job cannot hurt the daemon or a later session. A
+ *   retired port is reused only once no handle is left on it, and no port
+ *   is freed while the daemon runs.
  *
  * Why a private port: pr_MsgPort is where dos.library waits for the
  * replies to the process's own packets, and WaitPkt() takes whatever
@@ -137,7 +139,7 @@ static const char __attribute__((used)) verstag[] =
 
 #define IOBUF        1024
 #define MIN_STACK    16000            /* refuse to run on a smaller stack */
-#define DRAIN_SECS   3                /* after hangup the shell must end by then */
+#define EXIT_SECS    5                /* on Ctrl-C: time for hung-up shells to end */
 #define SPAWN_SECS   10               /* NewShell must open "*" by then */
 
 struct Library *SocketBase = NULL;    /* extern in proto/bsdsocket.h */
@@ -147,8 +149,11 @@ static int              gListen   = -1;
 static int              gSock     = -1;
 static BOOL             gBreak    = FALSE;
 
-/* the handler port and its timer port live as long as the daemon */
-static struct MsgPort  *gPort     = NULL;
+/* handler ports: the current session's, and the retired ones */
+static struct MsgPort  *gPort     = NULL;   /* NULL between sessions */
+static struct List      gRetired;           /* ports of ended sessions (mp_Node) */
+static BYTE             gPortSig  = -1;     /* shared by all handler ports */
+static volatile LONG    gHelpers  = 0;      /* spawn helpers that may still run our code */
 static struct MsgPort  *gTimePort = NULL;
 static struct timerequest *gTimer = NULL;   /* the one WAIT_CHAR timer */
 static BOOL             gTimerBusy = FALSE;
@@ -857,6 +862,66 @@ static void pump_input(void)
 /* === END portable input/editor section ================================= */
 
 
+/* ---------------- handler ports ---------------------------------------- */
+
+/* A handler port plus the handles still open on it after its session
+ * ended (a shell that outlived its client, a "run" job opening "*"): the
+ * port is not reused while there are any, so their END can never be
+ * taken off a later session's count. */
+struct HPort {
+    struct MsgPort  mp;               /* first: used as a plain MsgPort */
+    LONG            deadOpens;
+};
+
+/* A port on the shared signal: a CreateMsgPort per session would use up
+ * the 16 user signals once a few shells outlive their clients. */
+static struct MsgPort *port_new(void)
+{
+    struct MsgPort *p;
+    p = (struct MsgPort *)AllocMem(sizeof(struct HPort), MEMF_PUBLIC | MEMF_CLEAR);
+    if (!p) return NULL;
+    p->mp_Node.ln_Type = NT_MSGPORT;
+    p->mp_Flags = PA_SIGNAL;
+    p->mp_SigBit = (UBYTE)gPortSig;
+    p->mp_SigTask = FindTask(NULL);
+    NewList(&p->mp_MsgList);
+    return p;
+}
+
+/* The longest-retired port with no handles left on it, or a new one. */
+static struct MsgPort *port_get(void)
+{
+    struct Node *n;
+    for (n = gRetired.lh_Head; n->ln_Succ; n = n->ln_Succ) {
+        if (((struct HPort *)n)->deadOpens <= 0) {
+            Remove(n);
+            return (struct MsgPort *)n;
+        }
+    }
+    return port_new();
+}
+
+static LONG dead_opens(void)
+{
+    struct Node *n;
+    LONG sum = 0;
+    for (n = gRetired.lh_Head; n->ln_Succ; n = n->ln_Succ)
+        sum += ((struct HPort *)n)->deadOpens;
+    return sum;
+}
+
+/* Exit with processes possibly still holding a port as console task:
+ * leave it allocated but inert - PA_IGNORE queues without signalling, so a
+ * late packet waits forever instead of landing in freed memory. */
+static void port_abandon(struct MsgPort *p)
+{
+    Forbid();
+    p->mp_Flags = PA_IGNORE;
+    p->mp_SigTask = NULL;
+    Permit();
+}
+
+
 /* ---------------- packet plumbing -------------------------------------- */
 
 static struct DosPacket *pkt_of(struct Message *msg)
@@ -989,28 +1054,15 @@ static void service_reads(void)
     }
 }
 
-/* Which session a packet belongs to.
- *
- * As in telnetd 2.0, packets are not matched to sessions one by one:
- * while a session is live, every packet on the port is served as that
- * session's, and every END decrements gOpens. Between sessions
- * (gCookie == 0) or after a hangup, READ gets break/EOF and WRITE is
- * discarded. A process left over from an earlier session that still uses
- * the console during a new one (a "run >* ..." job, a shell that missed
- * DRAIN_SECS) is therefore treated as part of the new session, and its
- * END can end the new session early; the zombie gate in main() waits for
- * leftover handles to close before accepting, which makes that rare.
- *
- * Matching READ/WRITE/END on dp_Arg1 == gCookie (they carry the handle's
- * fh_Arg1) failed on hardware: READs did not match and were answered as
- * stale, for reasons never established. Before trying it again, log
- * dp_Arg1 and gCookie side by side on a READ. */
-
-/* Serves one packet from the handler port (see above for whose it is). */
-static void handle_packet(struct Message *msg)
+/* Serves one packet that arrived on `port`: the current session's port
+ * (gPort), or a retired one. Packets on a retired port belong to no
+ * session and are answered harmlessly; its open handles are counted on
+ * the port. */
+static void handle_packet(struct MsgPort *port, struct Message *msg)
 {
     struct DosPacket *pkt = pkt_of(msg);
-    BOOL live = (gCookie != 0 && !gHangup);
+    BOOL cur  = (port == gPort && gCookie != 0);
+    BOOL live = (cur && !gHangup);
 
     switch (pkt->dp_Type) {
 
@@ -1019,11 +1071,16 @@ static void handle_packet(struct Message *msg)
     case ACTION_FINDUPDATE: {
         /* Open("*") by a process whose console task is our port. */
         struct FileHandle *fh = (struct FileHandle *)BADDR((BPTR)pkt->dp_Arg1);
-        fh->fh_Type = gPort;
-        fh->fh_Port = gPort;                   /* non-zero = interactive */
-        fh->fh_Arg1 = gCookie;                 /* informational: not checked (see above) */
-        if (gCookie) { gOpens++; gSawOpen = TRUE; }
-        logmsg("telnetd: find, opens %ld\n", gOpens);
+        fh->fh_Type = port;
+        fh->fh_Port = port;                    /* non-zero = interactive */
+        fh->fh_Arg1 = cur ? gCookie : 0;       /* informational */
+        if (cur) {
+            gOpens++;
+            gSawOpen = TRUE;
+            logmsg("telnetd: find, opens %ld\n", gOpens);
+        } else {
+            ((struct HPort *)port)->deadOpens++;
+        }
         reply(pkt, DOSTRUE, 0);
         break;
     }
@@ -1082,8 +1139,13 @@ static void handle_packet(struct Message *msg)
 
     case ACTION_END:
         reply(pkt, DOSTRUE, 0);
-        gOpens--;
-        logmsg("telnetd: END, %ld handles left\n", gOpens);
+        if (cur) {
+            gOpens--;
+            logmsg("telnetd: END, %ld handles left\n", gOpens);
+        } else if (((struct HPort *)port)->deadOpens > 0) {
+            if (--((struct HPort *)port)->deadOpens == 0)
+                logmsg("telnetd: a hung-up shell has ended\n", 0);
+        }
         break;
 
     case ACTION_SEEK:
@@ -1115,11 +1177,16 @@ static void handle_packet(struct Message *msg)
     }
 }
 
-static void drain_port(void)
+static void drain_ports(void)
 {
     struct Message *msg;
-    while ((msg = GetMsg(gPort)) != NULL)
-        handle_packet(msg);
+    struct Node *n;
+    if (gPort)
+        while ((msg = GetMsg(gPort)) != NULL) handle_packet(gPort, msg);
+    for (n = gRetired.lh_Head; n->ln_Succ; n = n->ln_Succ) {
+        struct MsgPort *p = (struct MsgPort *)n;
+        while ((msg = GetMsg(p)) != NULL) handle_packet(p, msg);
+    }
 }
 
 
@@ -1131,20 +1198,25 @@ static void drain_port(void)
  * (most likely System() waiting on a packet to those handles that only
  * the blocked daemon could answer). */
 static BPTR g_spawnIn = 0, g_spawnOut = 0;
+static struct MsgPort *g_spawnPort = NULL;
+static struct Task    *g_daemonTask = NULL;
+static ULONG           g_spawnMask = 0;    /* helper -> daemon: "I have my copy" */
 
+/* Uses the daemon's DOSBase, which stays open until the daemon has seen
+ * every helper finish (gHelpers), so there is no failure path that could
+ * skip closing the handles or the gHelpers count. */
 static int spawner_entry(void)
 {
-    struct Library *dosBase;
     BPTR in = g_spawnIn, out = g_spawnOut;
+    struct MsgPort *port = g_spawnPort;
     LONG rc;
 
-    dosBase = OpenLibrary((STRPTR)"dos.library", 36);
-    if (!dosBase) return RETURN_FAIL;
+    Signal(g_daemonTask, g_spawnMask);         /* g_spawn* may be reused now */
 
     rc = SystemTags((STRPTR)"NewShell *",
                     SYS_Input,      in,
                     SYS_Output,     out,
-                    NP_ConsoleTask, (LONG)gPort,
+                    NP_ConsoleTask, (LONG)port,
                     NP_Cli,         TRUE,
                     TAG_DONE);
     /* NewShell starts the interactive shell as a NEW process and returns
@@ -1153,17 +1225,17 @@ static int spawner_entry(void)
      * the V36 SystemTagList autodoc says the caller must close them after
      * System returns, and AROS's systemtaglist.c only ever closes handles
      * it opened itself. Without this the two handles stay counted in
-     * gOpens forever and "endcli" never ends the session (the log then
-     * shows "zombie stuck, handles 2"). telnetd 2.0's SubSubProc does
+     * gOpens forever and "endcli" never ends the session. telnetd 2.0's
+     * SubSubProc does
      * exactly this, Forbid() first: this code lives in the daemon's seglist, and once the last
      * END is answered the daemon may exit and unload it. Close() waits for
      * our reply (Wait breaks the Forbid); after it returns we are
      * Forbid()den again until the process is gone. */
     logmsg("telnetd: helper rc %ld\n", rc);
-    CloseLibrary(dosBase);
     Forbid();
     Close(in);
     Close(out);
+    gHelpers--;                                /* still Forbid()den: we are gone */
     return (int)rc;
 }
 
@@ -1188,9 +1260,14 @@ static BPTR make_handle(void)
 static void run_session(void)
 {
     BPTR in, out;
-    LONG start = now_secs(), hangupAt = 0;
+    LONG start = now_secs();
     ULONG one = 1;
 
+    gPort = port_get();
+    if (!gPort) {
+        PutStr((STRPTR)"telnetd: out of memory for a session\n");
+        return;
+    }
     gSessions++;
     gCookie = gSessions;
     NewList(&gReadWait);
@@ -1240,8 +1317,9 @@ static void run_session(void)
      * NP_ConsoleTask = gPort for the interactive shell it starts. */
     gOpens = 2;
     logmsg("telnetd: session %ld, spawning shell\n", gCookie);
-    g_spawnIn  = in;
-    g_spawnOut = out;
+    g_spawnIn   = in;
+    g_spawnOut  = out;
+    g_spawnPort = gPort;
     {
         struct TagItem ptags[4];
         ptags[0].ti_Tag  = NP_Entry;
@@ -1252,6 +1330,10 @@ static void run_session(void)
         ptags[2].ti_Data = (LONG)"telnetd shell";
         ptags[3].ti_Tag  = TAG_END;
         ptags[3].ti_Data = 0;
+        /* A session can end within milliseconds (a client that connects
+         * and leaves at once) and the next one would overwrite g_spawn*
+         * before this helper has read them: wait for its copy. */
+        SetSignal(0, g_spawnMask);
         if (CreateNewProc(ptags) == NULL) {
             logmsg("telnetd: CreateNewProc failed\n", 0);
             FreeDosObject(DOS_FILEHANDLE, (APTR)BADDR(in));
@@ -1259,23 +1341,25 @@ static void run_session(void)
             gOpens = 0;
             goto done;
         }
+        Wait(g_spawnMask);
+        gHelpers++;
     }
     logmsg("telnetd: shell started\n", 0);
 
     for (;;) {
         fd_set rd;
         struct timeval tv;
-        ULONG mask = (1UL << gPort->mp_SigBit)
+        ULONG mask = (1UL << gPortSig)
                    | (1UL << gTimePort->mp_SigBit)
                    | SIGBREAKF_CTRL_C;
 
         /* Over when every handle is closed - but not before NewShell has
          * opened "*", or its late FINDINPUT would find no session. */
         if (gOpens <= 0 && (gSawOpen || now_secs() - start > SPAWN_SECS)) break;
-        if (gHangup) {
-            if (!hangupAt) hangupAt = now_secs();
-            else if (now_secs() - hangupAt > DRAIN_SECS) break;
-        }
+        /* Client gone: nothing left to wait for here - the shell got
+         * Ctrl-C and break/EOF, and if it has not ended yet its handles
+         * are carried by the retired port below. */
+        if (gHangup) break;
 
         /* Watch the socket whenever its input can be taken: keys are
          * echoed and a disconnect is seen even while a command runs. Not
@@ -1301,7 +1385,7 @@ static void run_session(void)
             charwait_update();
         }
 
-        drain_port();
+        drain_ports();
         pump_input();
         service_reads();
     }
@@ -1309,11 +1393,16 @@ static void run_session(void)
 done:
     gHangup = TRUE;
     flush_waiters();
-    if (gOpens > 0) {
-        PutStr((STRPTR)"telnetd: shell did not exit - left detached\n");
-        logmsg("telnetd: session %ld left detached\n", gCookie);
-    }
-    gCookie = 0;                               /* its packets are stale from now on */
+    if (gOpens > 0)
+        logmsg("telnetd: hung up, shell still has %ld handles\n", gOpens);
+    /* Retire the port with the handles still open on it: the shell's
+     * remaining packets are answered there, and the port is reused only
+     * once they are closed. */
+    ((struct HPort *)gPort)->deadOpens = gOpens > 0 ? gOpens : 0;
+    AddTail(&gRetired, &gPort->mp_Node);
+    gPort = NULL;
+    gOpens = 0;
+    gCookie = 0;
 }
 
 
@@ -1328,6 +1417,7 @@ int main(int argc, char **argv)
     ULONG port = 23;
     ULONG stack = (ULONG)self->pr_Task.tc_SPUpper - (ULONG)self->pr_Task.tc_SPLower;
     int one = 1;
+    BYTE spawnSig = -1;
     APTR oldwinptr = self->pr_WindowPtr;
 
     (void)argc; (void)argv;
@@ -1352,19 +1442,24 @@ int main(int argc, char **argv)
     }
     logmsg("telnetd: started, stack %ld\n", (LONG)stack);
 
-    gPort = CreateMsgPort();
+    NewList(&gRetired);
+    g_daemonTask = FindTask(NULL);
+    gPortSig = AllocSignal(-1);
+    spawnSig = AllocSignal(-1);
     gTimePort = CreateMsgPort();
     if (gTimePort)
         gTimer = (struct timerequest *)CreateIORequest(gTimePort, sizeof(struct timerequest));
-    if (!gPort || !gTimer ||
+    if (gPortSig < 0 || spawnSig < 0 || !gTimer ||
         OpenDevice((STRPTR)TIMERNAME, UNIT_MICROHZ, (struct IORequest *)gTimer, 0)) {
         PutStr((STRPTR)"telnetd: out of signals/memory\n");
         if (gTimer) DeleteIORequest((struct IORequest *)gTimer);
         if (gTimePort) DeleteMsgPort(gTimePort);
-        if (gPort) DeleteMsgPort(gPort);
+        if (gPortSig >= 0) FreeSignal(gPortSig);
+        if (spawnSig >= 0) FreeSignal(spawnSig);
         FreeArgs(rd);
         return RETURN_FAIL;
     }
+    g_spawnMask = 1UL << spawnSig;
     TimerBase = gTimer->tr_node.io_Device;
 
     SocketBase = OpenLibrary((STRPTR)"bsdsocket.library", 3);
@@ -1396,7 +1491,7 @@ int main(int argc, char **argv)
 
     while (!gBreak) {
         fd_set rdset;
-        ULONG mask = SIGBREAKF_CTRL_C | (1UL << gPort->mp_SigBit);
+        ULONG mask = SIGBREAKF_CTRL_C | (1UL << gPortSig);
         struct timeval tv;
         struct sockaddr_in ca;
         socklen_t calen = sizeof ca;
@@ -1407,27 +1502,9 @@ int main(int argc, char **argv)
         tv.tv_secs = 2;
         tv.tv_micro = 0;
         selr = WaitSelect(gListen + 1, &rdset, NULL, NULL, &tv, &mask);
-        drain_port();                        /* stragglers of earlier sessions */
+        drain_ports();                       /* shells that outlived their session */
         if (mask & SIGBREAKF_CTRL_C) break;
         if (selr <= 0 || !FD_ISSET(gListen, &rdset)) continue;
-
-        if (gOpens > 0) {                     /* zombie shell of last session */
-            LONG zw = 0;
-            BOOL zbreak = FALSE;
-            while (gOpens > 0 && zw < 3) {
-                struct timeval zt;
-                ULONG zm = SIGBREAKF_CTRL_C;
-                zt.tv_secs = 1;
-                zt.tv_micro = 0;
-                WaitSelect(0, NULL, NULL, NULL, &zt, &zm);
-                drain_port();
-                zw++;
-                if (zm & SIGBREAKF_CTRL_C) { zbreak = TRUE; break; }
-            }
-            if (gOpens <= 0) logmsg("telnetd: zombie drained\n", 0);
-            else logmsg("telnetd: zombie stuck, handles %ld\n", (LONG)gOpens);
-            if (zbreak) break;
-        }
 
         gSock = accept(gListen, (struct sockaddr *)&ca, &calen);
         if (gSock < 0) { logmsg("telnetd: accept failed, errno %ld\n", Errno()); continue; }
@@ -1445,28 +1522,41 @@ int main(int argc, char **argv)
 
 out:
     if (gListen >= 0) CloseSocket(gListen);
-    if (SocketBase) CloseLibrary(SocketBase);
+
+    /* Give shells of hung-up sessions EXIT_SECS to end, and wait - with no
+     * time limit - for every spawn helper: helpers run code in this
+     * program's seglist, which must not be unloaded under them. */
+    if (SocketBase) {
+        LONG until = now_secs() + EXIT_SECS;
+        BOOL note = FALSE;
+        while (gHelpers > 0 || (dead_opens() > 0 && now_secs() < until)) {
+            struct timeval tv;
+            ULONG m = 1UL << gPortSig;
+            tv.tv_secs = 1;
+            tv.tv_micro = 0;
+            WaitSelect(0, NULL, NULL, NULL, &tv, &m);
+            drain_ports();
+            if (gHelpers > 0 && !note && now_secs() >= until) {
+                PutStr((STRPTR)"telnetd: waiting for a shell to finish starting\n");
+                note = TRUE;
+            }
+        }
+        CloseLibrary(SocketBase);
+    }
     self->pr_WindowPtr = oldwinptr;
 
-    drain_port();
+    /* Processes started from a session (a "run" job, a shell that ignored
+     * the hangup) may keep a port as their console task and PutMsg to it
+     * after we are gone: every port is left allocated but inert. */
+    drain_ports();
+    while (!IsListEmpty(&gRetired))
+        port_abandon((struct MsgPort *)RemHead(&gRetired));
     timer_stop();                            /* idle outside a session anyway */
     CloseDevice((struct IORequest *)gTimer);
     DeleteIORequest((struct IORequest *)gTimer);
     DeleteMsgPort(gTimePort);
-    if (gSessions == 0) {
-        DeleteMsgPort(gPort);
-    } else {
-        /* Processes started from a session (a "run" job, a detached shell)
-         * keep this port as their console task and may PutMsg to it after
-         * we are gone. Leave it allocated but inert: PA_IGNORE queues
-         * without signalling, so a late packet waits forever instead of
-         * crashing the machine on freed memory. */
-        Forbid();
-        gPort->mp_Flags = PA_IGNORE;
-        gPort->mp_SigTask = NULL;
-        Permit();
-        FreeSignal(gPort->mp_SigBit);
-    }
+    FreeSignal(gPortSig);
+    FreeSignal(spawnSig);
     FreeArgs(rd);
     return RETURN_OK;
 }
