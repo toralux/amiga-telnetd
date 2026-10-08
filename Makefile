@@ -23,8 +23,10 @@ SANITIZE ?= -fsanitize=address,undefined
 test: tests/edtest
 	./tests/edtest
 
-tests/edtest: tests/edtest.c telnetd.c
-	awk '/=== BEGIN portable input\/editor section/{p=1} /=== END portable input\/editor section/{p=0} p' telnetd.c > tests/editor_part.c
+tests/editor_part.c: telnetd.c
+	awk '/=== BEGIN portable input\/editor section/{p=1} /=== END portable input\/editor section/{p=0} p' telnetd.c > $@
+
+tests/edtest: tests/edtest.c tests/editor_part.c
 	$(HOSTCC) -Wall -Wextra -Wno-unused-function -g $(SANITIZE) -o $@ tests/edtest.c
 
 clean:

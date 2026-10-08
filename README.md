@@ -2,8 +2,8 @@
 
 A really simple standalone telnet daemon for AmigaOS 2.04+ (tested on
 AmigaOS 3.1 / A500 68000). No inetd, no config files, no user database,
-no authentication. One connection at a time, real AmigaDOS shell per
-connection. Needs a bsdsocket TCP/IP stack (AmiTCP, AmiTCP_NG, Roadshow,
+no authentication. Several sessions at once (4 by default), each with its
+own real AmigaDOS shell. Needs a bsdsocket TCP/IP stack (AmiTCP, AmiTCP_NG, Roadshow,
 Miami).
 
 **License: MIT.** The session architecture (packet-serving filehandle,
@@ -18,14 +18,20 @@ only. See docs/DESIGN.md for the full architecture and provenance.
 1> stack 20000
 1> telnetd                     ; port 23
 1> telnetd 2323                ; custom port
+1> telnetd MAXSESSIONS=2       ; at most 2 sessions at once (1-8, default 4)
 1> telnetd LOG=T:tdbg.log      ; also write a crash-surviving trace (any path)
 1> telnetd DUMBTERM            ; for clients without ANSI support (see below)
 ```
 
 Then from any machine on the LAN: `telnet <amiga-ip>` and you get an
-AmigaDOS shell. `EndCLI` (or Ctrl-\) closes the session; the daemon waits
-for the next connection. Ctrl-C in the starting Shell stops the daemon,
-between sessions or mid-session (the remote shell gets EOF and ends).
+AmigaDOS shell. `EndCLI` (or Ctrl-\) closes the session. Other clients can
+connect at the same time, up to `MAXSESSIONS`; one more gets a "too many
+sessions" message and is disconnected. Ctrl-C in the starting Shell stops
+the daemon and ends every session (the remote shells get EOF and end).
+
+Each session costs about 11 KB in the daemon plus its own shell process.
+A slow client only slows its own shell: output is buffered per session,
+and a client that takes nothing for 60 seconds is disconnected.
 
 ### Stack
 
