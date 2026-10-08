@@ -69,6 +69,7 @@
 #include <exec/io.h>
 #include <exec/devices.h>
 #include <devices/timer.h>
+#include <devices/conunit.h>
 #include <dos/dos.h>
 #include <dos/dosextens.h>
 #include <dos/rdargs.h>
@@ -224,6 +225,8 @@ struct Console {
 
     /* client screen geometry, for drawing lines that wrap */
     LONG            cols;            /* from NAWS; 80 if the client never says */
+    LONG            rows;            /* from NAWS; 24 if the client never says */
+    BOOL            nawsSeen;        /* the client has reported a window size */
     BOOL            doNaws;          /* we have sent DO NAWS */
     LONG            termCol;         /* client cursor column (see term_track) */
     int             trkEsc;
@@ -242,6 +245,7 @@ static void con_init(struct Console *c, int sock, BOOL edit)
     c->sock = sock;
     c->edit = edit;
     c->cols = 80;
+    c->rows = 24;
     c->trkN1 = -1;
 }
 
@@ -364,8 +368,13 @@ static void sb_done(struct Console *c)
 {
     if (c->sbOpt == OPT_NAWS && c->sbLen >= 4) {
         LONG cols = ((LONG)c->sbBuf[0] << 8) | c->sbBuf[1];
+        LONG rows = ((LONG)c->sbBuf[2] << 8) | c->sbBuf[3];
         if (cols >= 20 && cols <= 1000) c->cols = cols;
-        logmsg("telnetd: window width %ld\n", c->cols);
+        if (rows >= 10 && rows <= 300)  c->rows = rows;
+        if ((cols >= 20 && cols <= 1000) && (rows >= 10 && rows <= 300))
+            c->nawsSeen = TRUE;
+        logmsg("telnetd: window %ld cols\n", c->cols);
+        logmsg("telnetd: window %ld rows\n", c->rows);
     }
 }
 
@@ -1334,7 +1343,15 @@ static void handle_packet(struct Session *s, struct MsgPort *port, struct Messag
              * Window pointer and ID_InUse the console io-request pointer
              * (AmigaDOS_Packets wiki); tools NULL-check both (AUX: rule).
              * A non-pointer value there (DOSTRUE!) is dereferenced by
-             * pagers such as More for screen dimensions -> 80000003. */
+             * pagers such as More for screen dimensions -> 80000003.
+             *
+             * Hardware-tested (2026-10-08): handing More a synthetic
+             * Window (id_VolumeNode, pixel geometry from NAWS) or a
+             * synthetic io-request/ConUnit (id_InUse) makes it produce
+             * no output at all - More follows these pointers into real
+             * Intuition/console machinery it then uses. Only NULL is
+             * safe, and it means More pages at its 640x200/8 = 24-line
+             * default regardless of the client's real window size. */
             memset(id, 0, sizeof *id);
         }
         reply(pkt, DOSTRUE, 0);
