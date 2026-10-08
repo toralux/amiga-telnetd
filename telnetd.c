@@ -112,11 +112,11 @@ static const char __attribute__((used)) verstag[] =
     "$VER: telnetd 0.5 (8.10.2026)";
 
 #define MIN_STACK    16000            /* refuse to run on a smaller stack */
-#define DRAIN_SECS   3                /* after hangup the shell should end by then */
+#define EXIT_SECS    5                /* on Ctrl-C: time for hung-up shells to end */
 #define SPAWN_SECS   10               /* NewShell must open "*" by then */
 #define CLOSE_SECS   5                /* after the shell ends: time to send its last output */
 #define STALL_SECS   60               /* client not taking output for this long: hang up */
-#define MAXSLOTS     16               /* sessions incl. detached ones */
+#define MAXSLOTS     16               /* live and closing sessions */
 #define DEFSESSIONS  4                /* MAXSESSIONS default */
 #define MAXSESSIONS_LIMIT 8
 
@@ -890,8 +890,7 @@ struct Session {
     struct Task    *breakTask;        /* receives Ctrl-C from the client */
     LONG            opens;            /* handles on port not yet ENDed */
     BOOL            sawOpen;          /* NewShell has opened "*" */
-    BOOL            detached;         /* hung up, shell still holding handles */
-    LONG            started, hangupAt, closingAt;
+    LONG            started, closingAt;
     LONG            stalledAt;        /* output waiting, socket full since (0: not) */
 };
 
@@ -984,6 +983,15 @@ static struct MsgPort *port_get(void)
 /* Exit with processes possibly still holding a port as console task:
  * leave it allocated but inert - PA_IGNORE queues without signalling, so a
  * late packet waits forever instead of landing in freed memory. */
+static LONG dead_opens(void)
+{
+    struct Node *n;
+    LONG sum = 0;
+    for (n = gRetired.lh_Head; n->ln_Succ; n = n->ln_Succ)
+        sum += ((struct HPort *)n)->deadOpens;
+    return sum;
+}
+
 static void port_abandon(struct MsgPort *p)
 {
     Forbid();
@@ -1134,7 +1142,6 @@ static void do_hangup(struct Console *c)
     slog(s, "hangup, %ld handles open\n", s->opens);
     send_break(c);
     c->hangup = TRUE;
-    s->hangupAt = now_secs();
     flush_waiters(s);
     c->oCount = 0;
     if (c->sock >= 0) { CloseSocket(c->sock); c->sock = -1; }
@@ -1307,7 +1314,8 @@ static void handle_packet(struct Session *s, struct MsgPort *port, struct Messag
             s->opens--;
             slog(s, "END, %ld handles left\n", s->opens);
         } else if (((struct HPort *)port)->deadOpens > 0) {
-            ((struct HPort *)port)->deadOpens--;
+            if (--((struct HPort *)port)->deadOpens == 0)
+                logmsg("telnetd: a hung-up shell has ended\n", 0);
         }
         break;
 
@@ -1486,12 +1494,21 @@ static int free_slot(void)
     return -1;
 }
 
+/* End a session: its port is retired with the handles still open on it
+ * (a hung-up shell that has not ended yet). A retired port keeps
+ * answering - READ break/EOF, WRITE discarded, FIND/END counted on the
+ * port - and is reused only once no handle is left on it, so such a shell
+ * costs one port, no session slot, and delays nobody. */
 static void session_free(int i)
 {
     struct Session *s = gSess[i];
     struct Message *msg;
     flush_waiters(s);
     if (s->con.sock >= 0) CloseSocket(s->con.sock);
+    if (s->opens > 0) {
+        slog(s, "hung up, shell still has %ld handles\n", s->opens);
+        ((struct HPort *)s->port)->deadOpens = s->opens;
+    }
     while ((msg = GetMsg(s->port)) != NULL) handle_packet(NULL, s->port, msg);
     AddTail(&gRetired, &s->port->mp_Node);    /* never freed while we run */
     slog(s, "session closed\n", 0);
@@ -1568,11 +1585,10 @@ static void session_step(int i)
         session_free(i);
         return;
     }
-    if (c->hangup && !s->detached && s->opens > 0 && now - s->hangupAt > DRAIN_SECS) {
-        s->detached = TRUE;
-        slog(s, "shell did not exit - left detached, %ld handles\n", s->opens);
-        PutStr((STRPTR)"telnetd: a shell did not exit - left detached\n");
-    }
+    /* Client gone: nothing left to wait for - the shell got Ctrl-C and
+     * break/EOF, and if it has not ended yet its handles are carried by
+     * the retired port. */
+    if (c->hangup) session_free(i);
 }
 
 
@@ -1693,11 +1709,12 @@ int main(int argc, char **argv)
             if (s->con.oCount > 0) FD_SET(s->con.sock, &wr);
             if (s->con.sock > maxfd) maxfd = s->con.sock;
         }
-        /* Stopping: wait (serving packets) until the sessions are gone or
-         * given up on - and, without any time limit, until no spawn helper
-         * can still return into this program's code. */
-        if (gBreak && gHelpers == 0 && (!any || now_secs() - breakAt > DRAIN_SECS)) break;
-        if (gBreak && gHelpers > 0 && !helperNote && now_secs() - breakAt > DRAIN_SECS) {
+        /* Stopping: wait (serving packets) up to EXIT_SECS for sessions
+         * and hung-up shells to end - and, without any time limit, until no
+         * spawn helper can still return into this program's code. */
+        if (gBreak && gHelpers == 0 &&
+            ((!any && dead_opens() == 0) || now_secs() - breakAt > EXIT_SECS)) break;
+        if (gBreak && gHelpers > 0 && !helperNote && now_secs() - breakAt > EXIT_SECS) {
             PutStr((STRPTR)"telnetd: waiting for a shell to finish starting\n");
             helperNote = TRUE;
         }

@@ -126,13 +126,15 @@ Red herrings from the earlier investigation:
    port are counted on the port, and a port is only reused once they are
    closed, so their ENDs can never be taken off a later session's count.
 9. **Hangup or Ctrl-C.** Signal Ctrl-C to the reading process, answer every
-   queued and future READ with break (0 bytes, `ERROR_BREAK`) so the shell
-   ends by itself, close the socket. A shell that has not ended after 3 s is
-   left detached: its session stays until its handles close, without
-   counting against `MAXSESSIONS`. Ctrl-C to the daemon hangs up every session
-   and waits (still serving packets) up to 3 s for them, and with no time
-   limit for every spawn helper: helpers run code in the daemon's seglist,
-   which must not be unloaded under them.
+   queued READ with break (0 bytes, `ERROR_BREAK`) so the shell ends by
+   itself, close the socket - and end the session at once, without waiting:
+   its port is retired with the number of handles still open on it, and the
+   retired port answers the shell's remaining packets. A shell that never
+   reacts (a command that ignores Ctrl-C and never reads) costs one port, no
+   session slot, and delays nobody. Ctrl-C to the daemon hangs up every
+   session and waits (still serving packets) up to 5 s for hung-up shells to
+   end, and with no time limit for every spawn helper: helpers run code in
+   the daemon's seglist, which must not be unloaded under them.
 10. **Exit.** Ports still in use and retired ports are left allocated with
     `PA_IGNORE`: a process that still has one as console task then blocks on
     a late packet instead of writing into freed memory.
