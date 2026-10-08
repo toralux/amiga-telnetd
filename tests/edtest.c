@@ -17,75 +17,24 @@
 typedef long LONG;
 typedef unsigned long ULONG;
 typedef short BOOL;
+typedef unsigned char UBYTE;
 typedef void *APTR;
 #define TRUE  1
 #define FALSE 0
-
-#define TEL_IAC  255
-#define TEL_DONT 254
-#define TEL_DO   253
-#define TEL_WONT 252
-#define TEL_WILL 251
-#define TEL_SB   250
-#define TEL_IP   244
-#define TEL_BRK  243
-#define TEL_SE   240
-#define OPT_ECHO   1
-#define OPT_SGA    3
-#define OPT_NAWS  31
-#define SOCK_EINTR        4
-#define SOCK_EWOULDBLOCK 35
-#define SOCK_ENXIO        6
 #define SIGBREAKF_CTRL_C 0x1000
 #define SIGBREAKF_CTRL_D 0x2000
 #define SIGBREAKF_CTRL_E 0x4000
 #define SIGBREAKF_CTRL_F 0x8000
 
-/* ---- the globals the section uses (as declared in telnetd.c) ---- */
-static int gSock = 1;
-static BOOL gHangup = FALSE, gRaw = FALSE;
-static BOOL gWill[256];
-static unsigned char gIn[256];
-static LONG gInHead = 0, gInTail = 0;
-static int gTelState = 0, gTelCmd = 0;
-static BOOL gLastCR = FALSE;
-#define READYSZ 1024
-static unsigned char gReady[READYSZ];
-static LONG gRHead = 0, gRCount = 0;
-static BOOL gEof = FALSE;
-#define LINEMAX 255
-#define HISTN   16
-static unsigned char gLine[LINEMAX];
-static LONG gLen = 0, gCur = 0;
-static unsigned char gSaved[LINEMAX];
-static LONG gSavedLen = 0;
-static unsigned char gHist[HISTN][LINEMAX];
-static LONG gHistLen[HISTN];
-static LONG gHistCount = 0, gHistNext = 0, gHistPos = 0;
-static int gEsc = 0;
-static LONG gEscParam = 0;
-static BOOL gEdit = TRUE;
-static LONG gCols = 80;
-static BOOL gDoNaws = FALSE;
-static LONG gTermCol = 0;
-static int gTrkEsc = 0;
-static LONG gTrkN = 0, gTrkN1 = -1;
-static LONG gStartCol = 0;
-static LONG gPos = 0;
-static int gSbOpt = 0;
-static unsigned char gSbBuf[8];
-static int gSbLen = 0;
-
-/* ---- stubs ---- */
+/* ---- socket input stub: bytes come from a script ---- */
 static unsigned char feed[1 << 16];
 static int feedLen, feedPos, chunk;
 static int hung;
 static ULONG sigs;
 static int negLen;
-static unsigned char negot[64];
 
 static void logmsg(const char *f, LONG a) { (void)f; (void)a; }
-static LONG Errno(void) { return SOCK_EWOULDBLOCK; }
+static LONG Errno(void) { return 35; }                  /* EWOULDBLOCK */
 static LONG recv(int s, APTR buf, LONG n, int fl)
 {
     LONG k;
@@ -99,12 +48,14 @@ static LONG recv(int s, APTR buf, LONG n, int fl)
     feedPos += (int)k;
     return k;
 }
-static void send_opt(int cmd, int opt)
-{
-    if (negLen < 60) { negot[negLen++] = 255; negot[negLen++] = (unsigned char)cmd; negot[negLen++] = (unsigned char)opt; }
-}
-static void send_signal(ULONG s) { sigs |= s; }
-static void send_break(void) { send_signal(SIGBREAKF_CTRL_C); }
+
+#include "editor_part.c"
+
+static struct Console C, *c = &C;
+
+/* the daemon's hooks */
+static void send_signal(struct Console *con, ULONG s) { (void)con; sigs |= s; }
+static void do_hangup(struct Console *con) { con->hangup = TRUE; }
 
 /* ---- terminal model ---- */
 #define ROWS 4000
@@ -115,21 +66,21 @@ static int tEsc, tN;
 
 static void fail(const char *what)
 {
-    printf("FAIL: %s (W=%d len=%ld cur=%ld start=%ld)\n", what, W, gLen, gCur, gStartCol);
+    printf("FAIL: %s (W=%d len=%ld cur=%ld start=%ld)\n", what, W, c->len, c->cur, c->startCol);
     exit(1);
 }
 
 static void term_clear(void) { memset(scr, ' ', sizeof scr); crow = ccol = pend = 0; tEsc = 0; }
 
-static void term_byte(unsigned char c)
+static void term_byte(unsigned char b)
 {
-    if (tEsc == 1) { if (c == '[') { tEsc = 2; tN = 0; return; } tEsc = 0; fail("ESC without ["); }
+    if (tEsc == 1) { if (b == '[') { tEsc = 2; tN = 0; return; } tEsc = 0; fail("ESC without ["); }
     if (tEsc == 2) {
         int n, r, k;
-        if (c >= '0' && c <= '9') { tN = tN * 10 + (c - '0'); return; }
+        if (b >= '0' && b <= '9') { tN = tN * 10 + (b - '0'); return; }
         tEsc = 0;
         n = tN ? tN : 1;
-        switch (c) {
+        switch (b) {
         case 'A': pend = 0; if (crow - n < 0) fail("cursor above row 0"); crow -= n; break;
         case 'B': pend = 0; if (crow + n >= ROWS) fail("cursor below screen"); crow += n; break;
         case 'C': pend = 0; if (ccol + n > W - 1) fail("CUF past margin"); ccol += n; break;
@@ -143,40 +94,39 @@ static void term_byte(unsigned char c)
         }
         return;
     }
-    switch (c) {
+    switch (b) {
     case 27: tEsc = 1; return;
     case 13: ccol = 0; pend = 0; return;
     case 10: pend = 0; if (++crow >= ROWS) fail("ran off the screen"); return;
     case 7:  return;
     case 8:  pend = 0; if (ccol > 0) ccol--; return;
     }
-    if (c < 32) fail("control byte sent to terminal");
+    if (b < 32) fail("control byte sent to terminal");
     if (pend) { pend = 0; ccol = 0; if (++crow >= ROWS) fail("ran off the screen"); }
-    scr[crow][ccol] = (char)c;
+    scr[crow][ccol] = (char)b;
     if (ccol == W - 1) pend = 1; else ccol++;
 }
 
-/* the editor's view of the world calls this (forward-declared there) */
-static void term_track(unsigned char c);
-
-/* as telnetd.c's sock_write: CSI -> ESC [, bare LF -> CR LF, IAC doubled
- * (the terminal sees one 255) - every byte through term_track */
-static LONG sock_write(const unsigned char *p, LONG n)
+/* Everything the console queued for the client goes to the terminal;
+ * telnet commands (IAC ...) are taken out, IAC IAC is a 255 byte. */
+static int iacState;
+static void drain(void)
 {
-    LONG i;
-    for (i = 0; i < n; i++) {
-        unsigned char c = p[i];
-        if (c == 0x9b)      { term_track(27); term_track('['); term_byte(27); term_byte('['); }
-        else if (c == 10 && (i == 0 || p[i - 1] != 13))
-                            { term_track(13); term_track(10); term_byte(13); term_byte(10); }
-        else                { term_track(c); term_byte(c); }
+    while (c->oCount > 0) {
+        unsigned char b = c->out[c->oHead];
+        c->oHead = (c->oHead + 1) & (OUTSZ - 1);
+        c->oCount--;
+        if (iacState == 0) {
+            if (b == 255) iacState = 1; else term_byte(b);
+        } else if (iacState == 1) {
+            if (b == 255) { term_byte(255); iacState = 0; }
+            else iacState = (b >= 251) ? 2 : 0;
+        } else {
+            iacState = 0;
+            negLen++;
+        }
     }
-    return 0;
 }
-
-#include "editor_part.c"
-
-static void do_hangup(void) { gHangup = TRUE; }
 
 /* ---- test plumbing ---- */
 static char prompt[300];
@@ -187,16 +137,18 @@ static char cell(long lin) { return scr[lin / W][lin % W]; }
 static void check(const char *ctx)
 {
     long off, startLin, i, endLin;
-    if (gEsc != 0 || !gWill[OPT_ECHO] || !gEdit || gRaw) return;
-    if (gLen == 0) return;          /* empty line: anchored at the next key, after the prompt */
+    if (c->dropped) { printf("[%s] ", ctx); fail("output bytes dropped"); }
+    if (c->esc != 0 || !c->will[OPT_ECHO] || !c->edit || c->raw) return;
+    if (c->writing) return;           /* line is off screen while output is written */
+    if (c->len == 0) return;          /* empty line: anchored at the next key, after the prompt */
     if (pend) { printf("[%s] ", ctx); fail("left in wrap-pending state"); }
-    off = gStartCol + gCur;
+    off = c->startCol + c->cur;
     if (ccol != off % W) { printf("[%s] col %d want %ld ", ctx, ccol, off % W); fail("cursor column"); }
-    startLin = (long)(crow - off / W) * W + gStartCol;
+    startLin = (long)(crow - off / W) * W + c->startCol;
     if (startLin < 0) fail("line start above screen");
-    for (i = 0; i < gLen; i++)
-        if ((unsigned char)cell(startLin + i) != gLine[i]) { printf("[%s] at %ld ", ctx, i); fail("screen != line"); }
-    endLin = startLin + gLen;
+    for (i = 0; i < c->len; i++)
+        if ((unsigned char)cell(startLin + i) != c->line[i]) { printf("[%s] at %ld ", ctx, i); fail("screen != line"); }
+    endLin = startLin + c->len;
     for (i = endLin; i < endLin + 3 * W; i++)
         if (cell(i) != ' ') { printf("[%s] junk at +%ld '%c' ", ctx, i - endLin, cell(i)); fail("junk after line"); }
     if (promptKnown) {
@@ -209,8 +161,8 @@ static void check(const char *ctx)
 /* Where the edited line starts on screen (linear cell index). */
 static long line_start(void)
 {
-    long off = gStartCol + gCur;
-    return (long)(crow - off / W) * W + gStartCol;
+    long off = c->startCol + c->cur;
+    return (long)(crow - off / W) * W + c->startCol;
 }
 
 /* Row `r` must read exactly `want` from column 0, blanks after it. */
@@ -218,28 +170,37 @@ static void expect_row(int r, const char *want, const char *ctx)
 {
     int i, n = (int)strlen(want);
     for (i = 0; i < W; i++) {
-        char c = i < n ? want[i] : ' ';
-        if (r < 0 || scr[r][i] != c) { printf("[%s] row %d col %d has '%c' ", ctx, r, i, r < 0 ? '?' : scr[r][i]); fail("row content"); }
+        char ch = i < n ? want[i] : ' ';
+        if (r < 0 || scr[r][i] != ch) { printf("[%s] row %d col %d has '%c' ", ctx, r, i, r < 0 ? '?' : scr[r][i]); fail("row content"); }
     }
 }
 
 static void program_output(const char *s)    /* an ACTION_WRITE from the shell */
 {
-    ed_output_begin();
-    sock_write((const unsigned char *)s, (LONG)strlen(s));
-    ed_output_end();
+    ed_output_begin(c);
+    con_write(c, (const unsigned char *)s, (LONG)strlen(s));
+    ed_output_end(c);
+    drain();
 }
 
 static void show_prompt(void) { program_output(prompt); promptKnown = 1; }
 
 static void keys(const char *s, int n)
 {
+    char ctx[24];                             /* printable copy for messages */
+    int k;
+    for (k = 0; k < n && k < (int)sizeof ctx - 1; k++)
+        ctx[k] = (s[k] >= 32 && s[k] < 127) ? s[k] : '.';
+    ctx[k] = 0;
     memcpy(feed + feedLen, s, (size_t)n);
     feedLen += n;
-    while (feedPos < feedLen || gInHead < gInTail) {
-        pump_input();
-        check(s);
-        if (ready_room() <= LINEMAX + 1) break;
+    while (feedPos < feedLen || c->inHead < c->inTail) {
+        int fp = feedPos;
+        LONG ih = c->inHead;
+        pump_input(c);
+        drain();
+        check(ctx);
+        if (feedPos == fp && c->inHead == ih) break;   /* console takes no more now */
     }
 }
 #define KEYS(s) keys(s, (int)sizeof(s) - 1)
@@ -247,7 +208,7 @@ static void keys(const char *s, int n)
 static int take_line(char *out)               /* what the shell's READ gets */
 {
     int n = 0;
-    while (gRCount > 0) { unsigned char c = ready_get(); out[n++] = (char)c; if (c == '\n') break; }
+    while (c->rCount > 0) { unsigned char b = ready_get(c); out[n++] = (char)b; if (b == '\n') break; }
     out[n] = 0;
     return n;
 }
@@ -262,11 +223,10 @@ static void expect(const char *want)
 
 static void fresh(int width, const char *p)
 {
-    gLen = gCur = gPos = 0; gHistCount = gHistNext = gHistPos = 0; gEsc = 0;
-    gRHead = gRCount = 0; gEof = FALSE; gRaw = FALSE; gEdit = TRUE; gHangup = FALSE;
-    gTelState = 0; gLastCR = FALSE; gInHead = gInTail = 0; feedLen = feedPos = 0;
-    memset(gWill, 0, sizeof gWill); gWill[OPT_ECHO] = gWill[OPT_SGA] = TRUE;
-    gCols = W = width; gTermCol = 0; gTrkEsc = 0; gStartCol = 0;
+    con_init(c, 1, TRUE);
+    con_negotiate(c);                         /* WILL ECHO, WILL SGA, DO NAWS */
+    c->cols = W = width;
+    feedLen = feedPos = 0; iacState = 0;
     chunk = 1 << 30; sigs = 0; hung = 0;
     term_clear();
     snprintf(prompt, sizeof prompt, "%s", p);
@@ -278,7 +238,7 @@ static void fresh(int width, const char *p)
 #define RIGHT "\033[C"
 #define LEFT  "\033[D"
 
-static void type_n(char c, int n) { int i; for (i = 0; i < n; i++) keys(&c, 1); }
+static void type_n(char ch, int n) { int i; for (i = 0; i < n; i++) keys(&ch, 1); }
 
 int main(void)
 {
@@ -299,12 +259,12 @@ int main(void)
         /* history with a saved half-typed line */
         fresh(w, p); KEYS("echo one\r"); expect("echo one\n"); KEYS("echo two\r"); expect("echo two\n");
         KEYS("par"); KEYS(UP); KEYS(UP); KEYS(UP); KEYS(DOWN); KEYS(DOWN);
-        if (gLen != 3 || memcmp(gLine, "par", 3)) fail("saved line");
+        if (c->len != 3 || memcmp(c->line, "par", 3)) fail("saved line");
         KEYS("\r"); expect("par\n");
 
         /* lines much longer than the width: type, recall, edit in the middle */
         fresh(w, p);
-        for (i = 0; i < 3 * w + 5; i++) { char c = (char)('a' + i % 26); keys(&c, 1); }
+        for (i = 0; i < 3 * w + 5; i++) { char ch = (char)('a' + i % 26); keys(&ch, 1); }
         KEYS("\r"); { char g[600]; take_line(g); if ((int)strlen(g) != 3 * w + 6) fail("long line"); show_prompt(); }
         KEYS("short\r"); expect("short\n");
         KEYS(UP); KEYS(UP);                   /* long line back, then shorter, then long */
@@ -312,18 +272,18 @@ int main(void)
         for (i = 0; i < w + 3; i++) KEYS(LEFT);
         KEYS("XY"); KEYS("\177"); KEYS("\033[3~");
         KEYS("\033[H"); KEYS("\033[F"); KEYS("\033[1~"); KEYS("\033[4~");
-        { char g[600]; char want[600]; int n = (int)gLen; memcpy(want, gLine, (size_t)n); want[n] = '\n'; want[n + 1] = 0;
+        { char g[600]; char want[600]; int n = (int)c->len; memcpy(want, c->line, (size_t)n); want[n] = '\n'; want[n + 1] = 0;
           KEYS("\r"); take_line(g); if (strcmp(g, want)) fail("edited long line"); show_prompt(); }
 
         /* Enter with the cursor at the start of a wrapped line: the whole
          * line must stay on screen above the next prompt */
         fresh(w, p);
-        for (i = 0; i < 2 * w + 7; i++) { char c = (char)('A' + i % 26); keys(&c, 1); }
+        for (i = 0; i < 2 * w + 7; i++) { char ch = (char)('A' + i % 26); keys(&ch, 1); }
         KEYS("\033[H");
         {
-            long st = line_start(), n = gLen;
+            long st = line_start(), n = c->len;
             char saved[600];
-            memcpy(saved, gLine, (size_t)n);
+            memcpy(saved, c->line, (size_t)n);
             KEYS("\r");
             for (i = 0; i < n; i++) if (cell(st + i) != saved[i]) fail("line damaged by Enter mid-line");
             { char g[600]; take_line(g); show_prompt(); }
@@ -339,7 +299,7 @@ int main(void)
 
         /* kill to end on a wrapped line */
         fresh(w, p); type_n('q', 2 * w); for (i = 0; i < w + 1; i++) KEYS(LEFT); KEYS("\013");
-        if (gLen != w - 1) fail("kill to end");
+        if (c->len != w - 1) fail("kill to end");
         KEYS("\r"); { char g[600]; take_line(g); show_prompt(); }
 
         /* typeahead while a command prints: the line moves below the output,
@@ -372,28 +332,81 @@ int main(void)
     KEYS("\033\377\373\001[A\r"); expect("ls\n");
 
     /* NAWS: width from the client, escaped 255 inside the subnegotiation */
-    fresh(80, "> "); KEYS("\377\372\037\000\144\000\050\377\360"); if (gCols != 100) fail("NAWS 100");
-    KEYS("\377\372\037\000\377\377\000\050\377\360"); if (gCols != 255) fail("NAWS 255 (escaped)");
+    fresh(80, "> "); KEYS("\377\372\037\000\144\000\050\377\360"); if (c->cols != 100) fail("NAWS 100");
+    KEYS("\377\372\037\000\377\377\000\050\377\360"); if (c->cols != 255) fail("NAWS 255 (escaped)");
 
     /* 255-char limit, signals, EOF */
-    fresh(80, "> "); type_n('a', 260); if (gLen != LINEMAX) fail("limit");
+    fresh(80, "> "); type_n('a', 260); if (c->len != LINEMAX) fail("limit");
     KEYS("\030"); KEYS("\003"); KEYS("\004"); if (!(sigs & SIGBREAKF_CTRL_C) || !(sigs & SIGBREAKF_CTRL_D)) fail("signals");
-    KEYS("\034"); if (!gEof) fail("Ctrl-\\ EOF");
+    KEYS("\034"); if (!c->eof) fail("Ctrl-\\ EOF");
 
     /* DONT ECHO: nothing drawn, line still delivered */
-    fresh(80, "> "); gWill[OPT_ECHO] = FALSE; KEYS("silent\r"); { char g[64]; take_line(g); if (strcmp(g, "silent\n")) fail("no-echo line"); }
+    fresh(80, "> "); c->will[OPT_ECHO] = FALSE; KEYS("silent\r"); { char g[64]; take_line(g); if (strcmp(g, "silent\n")) fail("no-echo line"); }
 
     /* raw mode: bytes through, CR stays CR, no echo */
-    fresh(80, "> "); gRaw = TRUE; KEYS("q\r\033[A");
-    { unsigned char b[16]; int n = 0; while (gRCount) b[n++] = ready_get();
+    fresh(80, "> "); c->raw = TRUE; KEYS("q\r\033[A");
+    { unsigned char b[16]; int n = 0; while (c->rCount) b[n++] = ready_get(c);
       if (n != 5 || b[0] != 'q' || b[1] != 13 || b[2] != 27) fail("raw bytes"); }
 
     /* DUMBTERM: client-edited lines collected, no echo, BS honoured */
-    fresh(80, "> "); gEdit = FALSE; gWill[OPT_ECHO] = FALSE;
+    fresh(80, "> "); c->edit = FALSE; c->will[OPT_ECHO] = FALSE;
     KEYS("ab\bc\r"); { char g[64]; take_line(g); if (strcmp(g, "ac\n")) fail("DUMBTERM line"); }
 
+    /* a client flooding option requests while output is backed up cannot
+     * eat the editor's reserve: no byte is ever dropped, the screen still
+     * matches the line, and the typed line survives */
+    fresh(40, "> ");
+    type_n('L', 200);                         /* redraw after the output needs ~210 bytes */
+    { static unsigned char big[OUTSZ]; static char flood[3 * 600]; int k;
+      memset(big, 'o', sizeof big);
+      c->writing = TRUE;
+      ed_output_begin(c);
+      con_write(c, big, (OUTSZ - ED_RESERVE) - 16);   /* as full as service_writes gets it */
+      for (k = 0; k < 600; k++) { flood[3*k] = (char)255; flood[3*k+1] = (char)253; flood[3*k+2] = (char)(40 + k % 50); }
+      /* DO <opt> x 600, read while writing; nothing is sent meanwhile
+       * (the client is not taking output), so the buffer stays backed up */
+      memcpy(feed + feedLen, flood, sizeof flood); feedLen += (int)sizeof flood;
+      pump_input(c);
+      ed_output_end(c);
+      if (c->dropped != 0) fail("output bytes dropped under an option flood");
+      drain(); promptKnown = 0; check("after option flood");
+      pump_input(c); drain(); check("after option flood, held keys");
+      KEYS("\030"); }
+
     /* hangup */
-    fresh(80, "> "); hung = 1; pump_input(); if (!gHangup) fail("hangup");
+    fresh(80, "> "); hung = 1; pump_input(c); if (!c->hangup) fail("hangup");
+
+    /* output buffer: CR at the end of one write and LF at the start of the
+     * next stay one CR LF; no input is taken while a WRITE is half queued
+     * or the editor's reserve is used up */
+    fresh(80, "> ");
+    { LONG before = c->oCount;
+      con_write(c, (const unsigned char *)"\r", 1); con_write(c, (const unsigned char *)"\n", 1);
+      if (c->oCount - before != 2) fail("CR + LF across writes doubled");
+      drain(); }
+    /* during a WRITE keys are read but held (no echo into the output);
+     * Ctrl-C acts at once; the held keys are edited when the WRITE ends */
+    c->writing = TRUE;
+    if (con_can_edit(c)) fail("editing during a WRITE");
+    if (!con_wants_input(c)) fail("socket not read during a WRITE");
+    sigs = 0;
+    KEYS("ab\003cd");
+    if (!(sigs & SIGBREAKF_CTRL_C)) fail("Ctrl-C held back during a WRITE");
+    if (c->hCount != 4 || c->len != 0) fail("keys not held during a WRITE");
+    c->writing = FALSE;
+    KEYS("\r");
+    expect("abcd\n");
+    /* held buffer full: the socket is left alone */
+    c->writing = TRUE;
+    { int k; for (k = 0; k < HELDSZ + 10; k++) KEYS("z"); }
+    if (c->hCount != HELDSZ || con_wants_input(c)) fail("held buffer limit");
+    c->writing = FALSE; feedLen = feedPos = 0; c->inHead = c->inTail = 0;
+    pump_input(c); drain();
+    KEYS("\030");
+    { static unsigned char big[OUTSZ]; memset(big, 'o', sizeof big);
+      con_write(c, big, OUTSZ - ED_RESERVE + 1);
+      if (con_can_edit(c)) fail("editing without editor reserve");
+      drain(); if (!con_can_edit(c)) fail("editing refused with room"); }
 
     /* fuzz: random keys and program output at random widths and prompts */
     srand(12345);
@@ -414,8 +427,8 @@ int main(void)
             check("fuzz output");
         } else if (key[0] == '\r') {
             char shown[600], got[600];
-            int n = (int)gLen;
-            memcpy(shown, gLine, (size_t)n); shown[n] = '\n'; shown[n + 1] = 0;
+            int n = (int)c->len;
+            memcpy(shown, c->line, (size_t)n); shown[n] = '\n'; shown[n + 1] = 0;
             keys(key, 1);
             take_line(got);
             if (strcmp(got, shown)) fail("fuzz delivered line");

@@ -2,8 +2,8 @@
 
 A really simple standalone telnet daemon for AmigaOS 2.04+ (tested on
 AmigaOS 3.1 / A500 68000). No inetd, no config files, no user database,
-no authentication. One connection at a time, real AmigaDOS shell per
-connection. Needs a bsdsocket TCP/IP stack (AmiTCP, AmiTCP_NG, Roadshow,
+no authentication. Several sessions at once (4 by default), each with its
+own real AmigaDOS shell. Needs a bsdsocket TCP/IP stack (AmiTCP, AmiTCP_NG, Roadshow,
 Miami).
 
 **License: MIT.** The session architecture (packet-serving filehandle,
@@ -18,21 +18,41 @@ only. See docs/DESIGN.md for the full architecture and provenance.
 1> stack 20000
 1> telnetd                     ; port 23
 1> telnetd 2323                ; custom port
+1> telnetd MAXSESSIONS=2       ; at most 2 sessions at once (1-8, default 4)
+1> telnetd SHELLSTACK=40000    ; stack for commands in the sessions (default 20000)
 1> telnetd LOG=T:tdbg.log      ; also write a crash-surviving trace (any path)
 1> telnetd DUMBTERM            ; for clients without ANSI support (see below)
 ```
 
 Then from any machine on the LAN: `telnet <amiga-ip>` and you get an
-AmigaDOS shell. `EndCLI` (or Ctrl-\) closes the session; the daemon waits
-for the next connection. Ctrl-C in the starting Shell stops the daemon,
-between sessions or mid-session (the remote shell gets EOF and ends).
+AmigaDOS shell. `EndCLI` (or Ctrl-\) closes the session. Other clients can
+connect at the same time, up to `MAXSESSIONS`; one more gets a "too many
+sessions" message and is disconnected. Ctrl-C in the starting Shell stops
+the daemon and ends every session (the remote shells get EOF and end).
+
+Each session costs about 11 KB in the daemon plus its own shell process.
+A slow client only slows its own shell: output is buffered per session,
+and a client that takes nothing for 60 seconds is disconnected.
 
 ### Stack
 
-telnetd refuses to start on less than 16000 bytes of stack and says so.
-bsdsocket.library calls run on the caller's stack (AmiTCP_NG documents a
-~1.5 KB protocol call depth with no guard) and a 68000 has no MMU to
-catch an overrun, so the default 4 KB Shell stack is not enough margin.
+Two different stacks matter.
+
+**The daemon's own** (`stack 20000` before starting it): telnetd refuses
+to start on less than 16000 bytes and says so. 20000 is ample, also with
+several sessions: all session state is on the heap, telnetd's own call
+depth stays under 1 KB, and the rest is headroom for bsdsocket.library and
+dos.library, which run on the caller's stack (AmiTCP_NG documents a ~1.5 KB
+protocol call depth with no guard; a 68000 has no MMU to catch an overrun).
+The default 4 KB Shell stack is not enough margin.
+
+**The remote shells'**: commands typed in a telnet session run with the
+session shell's stack, not the daemon's - the shell is started by a helper
+process that has no `stack` setting to pass on, so without help it would
+get the DOS default of about 4 KB. telnetd asks for `SHELLSTACK` bytes
+(default 20000) when it starts each shell. Type `stack` in a session to see
+what a shell actually got; `stack <n>` there, or a `Stack` line in
+`S:Shell-Startup`, changes it like in any Shell.
 
 ### Running in the background
 

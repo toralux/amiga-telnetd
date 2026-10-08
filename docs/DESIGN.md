@@ -1,4 +1,4 @@
-# telnetd v0.4 — Design
+# telnetd — Design
 
 Architecture follows the approach of **telnetd 2.0** (Peter Simons & Steve Holland, 1995,
 Aminet `comm/tcp/telnetd2_0.lha`): the shell's stdio is a DOS filehandle whose
@@ -65,59 +65,82 @@ Red herrings from the earlier investigation:
 - The NULL-timeout `WaitSelect`. It is handled in `amiga_generic.c`.
 - 68020 opcodes. Both binaries are 68000-clean by disassembly.
 
-## v0.4 architecture (one process, one session at a time)
+## Architecture (one process, several sessions)
 
 1. **Startup.** Refuse to run on less than 16000 bytes of stack. bsdsocket
    calls run on the caller's stack, and a 68000 has no MMU to catch an overrun.
-   Allocate one signal shared by all handler ports, and a timer port with one
-   timer.device request for every WaitForChar.
-2. **Accept loop.** `WaitSelect` on the listener with a 2 s timeout, Ctrl-C and
-   the handler-port signal. Packets on retired ports (below) are answered
-   here: READ gets break/EOF, WRITE is discarded.
-3. **Session.** Make the socket non-blocking (FIONBIO) and put the client in
-   character mode (WILL ECHO, WILL SGA). Allocate two filehandles
-   (`AllocDosObject` → `MKBADDR`) with `fh_Type` = the session's own handler
-   port (a retired one with no handles left on it, or a new one), `fh_Port`
-   non-zero (interactive), `fh_Pos = fh_End = -1`. A short-lived helper process
-   runs `SystemTags("NewShell *", SYS_Input=in, SYS_Output=out,
-   NP_ConsoleTask=port, NP_Cli)` synchronously, then closes both handles
-   (`Forbid(); Close(); Close()`, as telnetd 2.0 does: synchronous System()
-   does not close them). Calling `SystemTags(SYS_Asynch)` from the daemon
-   itself hung on hardware (v0.4). NewShell opens `*`, and those FIND packets
-   go to the console task, the session's port.
-4. **Packet loop.** It serves FIND*/READ/WRITE/WAIT_CHAR/SCREEN_MODE/
-   CHANGE_SIGNAL/END/SEEK/DISK_INFO/IS_FILESYSTEM. Handles are counted, and
-   the session ends when the count reaches zero (only after NewShell has
-   opened `*`, so a late FIND cannot miss the session). In cooked mode the
-   daemon is the line editor (echo, cursor keys, 16-line history), as CON: is
-   on a real Amiga; raw mode passes keys through. The editor learns the
-   window width with telnet NAWS and follows the client's cursor column
-   through everything it sends, so wrapped lines and typeahead during
-   command output are drawn correctly. `DUMBTERM` turns the editor off for
-   non-ANSI clients: they edit lines themselves (telnet line mode). The
-   editor and input decoder are tested on the host (`make test`,
-   tests/edtest.c). One timer.device request,
-   opened at startup, times every pending WaitForChar.
-
-   A packet's session is the port it arrives on, so a process left over
-   from an earlier session can never be taken for the current one.
-5. **Hangup or Ctrl-C.** Signal Ctrl-C to the reading process and answer
-   every queued READ with break (0 bytes, `ERROR_BREAK`), so the shell ends
-   by itself - then end the session at once, without waiting for it: the
-   port is retired with the number of handles still open on it. A retired
-   port keeps answering (READ break/EOF, WRITE discarded, FIND/END counted on
-   the port) and is reused only once no handle is left on it, so a shell
-   that never reacts (a command that ignores Ctrl-C and never reads) costs
-   one port and delays nobody: the next client is served at once.
-6. **Exit.** Ctrl-C ends the session as above, then waits (still answering
-   packets) up to 5 s for hung-up shells to end, and with no time limit for
-   the spawn helper: it runs code in the daemon's seglist, which must not be
-   unloaded under it. Every port is left allocated with `PA_IGNORE`: a
-   process that still has one as console task then blocks on a late packet,
-   which is better than writing into freed memory.
+   Allocate one signal shared by all handler ports, one for the spawn
+   handshake, and a timer port with one timer.device request for every
+   WaitForChar.
+2. **Main loop.** One `WaitSelect` covers the listening socket (while fewer
+   than `MAXSESSIONS` sessions are live), every session's socket (read when
+   its console can take input, write when its output buffer holds data),
+   Ctrl-C, the shared port signal and the timer signal. Each pass serves the
+   timer, drains every handler port, steps every session (queued writes,
+   output, input, reads, lifecycle), then accepts.
+3. **Per-session state.** `struct Session` wraps a portable `struct Console`
+   (input decoder, ready queue, output buffer, line editor and history, screen
+   geometry - the code `make test` compiles on the host) with the Amiga parts:
+   its handler port, READ and WRITE queues, handle count and break task.
+4. **Handler ports.** Each session has its own port, built by hand on the
+   shared signal bit (a CreateMsgPort per session would exhaust the 16 user
+   signals). A packet's session is the port it arrives on, so sessions never
+   see each other's traffic. When a session ends its port is retired, not
+   freed: retired ports are still drained (READ gets break/EOF, WRITE is
+   discarded) and reused for new sessions, because a process started from a
+   session (a `run` job) keeps the port as its console task. Only such a
+   leftover can ever meet a later session, after its port has been reused.
+5. **Starting a shell.** Make the socket non-blocking, negotiate (character
+   mode with server echo and NAWS, or nothing with `DUMBTERM`), allocate two
+   filehandles (`AllocDosObject` → `MKBADDR`) with `fh_Type` = the session's
+   port, `fh_Port` non-zero (interactive), `fh_Pos = fh_End = -1`. A
+   short-lived helper process copies them, signals the daemon (so the next
+   session cannot overwrite them first), runs `SystemTags("NewShell *",
+   SYS_Input=in, SYS_Output=out, NP_ConsoleTask=port, NP_Cli,
+   NP_StackSize=SHELLSTACK)` synchronously (the helper has no CLI, so without
+   NP_StackSize the session shell's command stack would be the DOS default),
+   then `Forbid(); Close(); Close()` as telnetd 2.0 does (synchronous System()
+   does not close them). `SystemTags(SYS_Asynch)` from the daemon itself hung
+   on hardware: the daemon is the handler of those handles. NewShell opens
+   `*`, and those FIND packets go to the console task, the session's port.
+6. **Output.** Everything for the client goes into the session's 4 KB output
+   buffer and is sent as the socket takes it. A WRITE is copied in chunks,
+   keeping 1 KB free for the line editor, and answered only when all of it is
+   queued - a slow client blocks only its own shell. A client that takes
+   nothing for 60 s is hung up. While a WRITE is half queued (or the shell is
+   not reading) the socket is still read: keys go into a 256-byte held buffer
+   and are edited and echoed once the editor can take them, so typed keys
+   never land in the middle of output, while Ctrl-C, telnet "interrupt
+   process" and a disconnect take effect at once.
+7. **Console.** In cooked mode the daemon is the line editor (echo, cursor
+   keys, 16-line history), as CON: is on a real Amiga; raw mode passes keys
+   through. The editor learns the window width with telnet NAWS and follows
+   the client's cursor column through everything it sends, so wrapped lines
+   and typeahead during command output are drawn correctly. `DUMBTERM` turns
+   the editor off for non-ANSI clients: they edit lines themselves (telnet
+   line mode).
+8. **Session end.** When every handle on the port is closed (only after
+   NewShell has opened `*`), the remaining output is sent (up to 5 s), the
+   socket closed and the port retired. A FIND arriving meanwhile (a `run`
+   job opening `*`) puts the session back in use. Handles opened on a retired
+   port are counted on the port, and a port is only reused once they are
+   closed, so their ENDs can never be taken off a later session's count.
+9. **Hangup or Ctrl-C.** Signal Ctrl-C to the reading process, answer every
+   queued READ with break (0 bytes, `ERROR_BREAK`) so the shell ends by
+   itself, close the socket - and end the session at once, without waiting:
+   its port is retired with the number of handles still open on it, and the
+   retired port answers the shell's remaining packets. A shell that never
+   reacts (a command that ignores Ctrl-C and never reads) costs one port, no
+   session slot, and delays nobody. Ctrl-C to the daemon hangs up every
+   session and waits (still serving packets) up to 5 s for hung-up shells to
+   end, and with no time limit for every spawn helper: helpers run code in
+   the daemon's seglist, which must not be unloaded under them.
+10. **Exit.** Ports still in use and retired ports are left allocated with
+    `PA_IGNORE`: a process that still has one as console task then blocks on
+    a late packet instead of writing into freed memory.
 
 All DOS I/O of the daemon itself (`PutStr`, `LOG=` trace) goes through its own
-`pr_MsgPort` and can no longer meet shell traffic. All socket calls stay in the
+`pr_MsgPort` and never meets shell traffic. All socket calls stay in the
 process that opened bsdsocket.library (AmiTCP_NG enforces this per SocketBase).
 
 ## License
