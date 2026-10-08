@@ -979,7 +979,7 @@ struct Session {
 };
 
 static struct Session  *gSess[MAXSLOTS];
-static BOOL             gConWinWanted = FALSE;  /* CONWINDOW */
+static BOOL             gConWinWanted = TRUE;   /* console window is the default since 0.5.1 */
 static struct Window   *gConWin = NULL;         /* shared 1x1 window for More & co. */
 static BOOL             gConWinUsed = FALSE;    /* handed out at least once */
 static struct List      gRetired;         /* ports of ended sessions (mp_Node) */
@@ -1739,7 +1739,7 @@ static void session_step(int i)
 
 int main(int argc, char **argv)
 {
-    LONG args[6] = { 0, 0, 0, 0, 0, 0 };
+    LONG args[7] = { 0, 0, 0, 0, 0, 0, 0 };
     struct RDArgs *rd;
     struct sockaddr_in sa;
     struct Process *self = (struct Process *)FindTask(NULL);
@@ -1759,9 +1759,9 @@ int main(int argc, char **argv)
         return RETURN_FAIL;
     }
 
-    rd = ReadArgs((STRPTR)"PORT/N,LOG/K,DUMBTERM/S,MAXSESSIONS/K/N,SHELLSTACK/K/N,CONWINDOW/S", args, NULL);
+    rd = ReadArgs((STRPTR)"PORT/N,LOG/K,DUMBTERM/S,MAXSESSIONS/K/N,SHELLSTACK/K/N,CONWINDOW/S,NOCONWINDOW/S", args, NULL);
     if (rd == NULL) {
-        PutStr((STRPTR)"usage: telnetd [PORT <n>] [LOG <file>] [DUMBTERM] [MAXSESSIONS <n>] [SHELLSTACK <bytes>] [CONWINDOW]\n");
+        PutStr((STRPTR)"usage: telnetd [PORT <n>] [LOG <file>] [DUMBTERM] [MAXSESSIONS <n>] [SHELLSTACK <bytes>] [NOCONWINDOW]\n");
         return RETURN_FAIL;
     }
     if (args[0]) port = *(ULONG *)args[0];
@@ -1776,10 +1776,15 @@ int main(int argc, char **argv)
         gShellStack = *(LONG *)args[4];
         if (gShellStack < 4000) gShellStack = 4000;
     }
-    if (args[5]) {                            /* CONWINDOW */
+    /* args[5] = CONWINDOW: accepted as a no-op; the console window is
+     * the default since 0.5.1 (it was the opt-in switch before). */
+    if (args[6]) gConWinWanted = FALSE;       /* NOCONWINDOW */
+    if (gConWinWanted) {
         IntuitionBase = (struct IntuitionBase *)OpenLibrary((STRPTR)"intuition.library", 36);
-        if (IntuitionBase) gConWinWanted = TRUE;
-        else PutStr((STRPTR)"telnetd: no intuition.library - CONWINDOW off\n");
+        if (!IntuitionBase) {
+            PutStr((STRPTR)"telnetd: no intuition.library - console window off\n");
+            gConWinWanted = FALSE;
+        }
     }
     if (gLogName) {                          /* fresh trace per run */
         BPTR f = Open(gLogName, MODE_NEWFILE);
