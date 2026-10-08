@@ -408,6 +408,39 @@ int main(void)
       if (con_can_edit(c)) fail("editing without editor reserve");
       drain(); if (!con_can_edit(c)) fail("editing refused with room"); }
 
+    /* cursor row tracking and window bounds report */
+    fresh(40, "> ");
+    c->rows = 10;
+    c->oCount = 0;
+    con_write(c, (const unsigned char *)"\033[1;1H", 6);
+    if (c->termRow != 0 || c->termCol != 0) fail("CUP home");
+    con_write(c, (const unsigned char *)"a\nb\nc\n", 6);
+    if (c->termRow != 3) fail("row after 3 LF");
+    { int k; for (k = 0; k < 20; k++) con_write(c, (const unsigned char *)"\n", 1); }
+    if (c->termRow != 9) fail("row clamps at the bottom (scroll)");
+    con_write(c, (const unsigned char *)"\033[5;3H", 6);
+    if (c->termRow != 4 || c->termCol != 2) fail("CUP row;col");
+    con_write(c, (const unsigned char *)"\033[2A", 4);
+    if (c->termRow != 2) fail("CUU");
+    con_write(c, (const unsigned char *)"\033[H", 3);
+    { static unsigned char xs[45]; memset(xs, 'x', sizeof xs);
+      con_write(c, xs, sizeof xs); }
+    if (c->termRow != 1 || c->termCol != 5) fail("row after wrap");
+    { unsigned char csiq[4] = { 0x9b, '0', ' ', 'q' };
+      LONG before = c->rCount;
+      con_write(c, csiq, 4);
+      { static const char want[] = "\2331;1;10;40 r";
+        int k; if (c->rCount - before != (LONG)strlen(want)) fail("bounds report length");
+        for (k = 0; k < (int)strlen(want); k++)
+          if (ready_get(c) != (unsigned char)want[k]) fail("bounds report bytes"); } }
+    con_write(c, (const unsigned char *)"\033[2 q", 5);   /* DECSCUSR 2: not a request */
+    if (c->rCount != 0) fail("cursor-style sequence answered as a request");
+    con_write(c, (const unsigned char *)"a\nb", 3);
+    if (c->termRow < 2) fail("rows moved before FF test");
+    con_write(c, (const unsigned char *)"\014", 1);
+    if (c->termRow != 0 || c->termCol != 0) fail("FF homes the cursor");
+    c->oCount = 0;
+
     /* fuzz: random keys and program output at random widths and prompts */
     srand(12345);
     for (t = 0; t < 60000; t++) {

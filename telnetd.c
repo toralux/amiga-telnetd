@@ -77,6 +77,8 @@
 
 #include <proto/exec.h>
 #include <proto/dos.h>
+#include <intuition/intuition.h>
+#include <proto/intuition.h>
 #include <proto/alib.h>
 #include <proto/timer.h>
 
@@ -122,6 +124,7 @@ static const char __attribute__((used)) verstag[] =
 #define MAXSESSIONS_LIMIT 8
 
 struct Library *SocketBase = NULL;    /* extern in proto/bsdsocket.h */
+struct IntuitionBase *IntuitionBase = NULL;   /* extern in proto/intuition.h; only with CONWINDOW */
 
 static STRPTR           gLogName  = NULL;
 
@@ -229,6 +232,8 @@ struct Console {
     BOOL            nawsSeen;        /* the client has reported a window size */
     BOOL            doNaws;          /* we have sent DO NAWS */
     LONG            termCol;         /* client cursor column (see term_track) */
+    LONG            termRow;         /* client cursor row, 0-based (see term_track) */
+    BOOL            trkSpace;        /* CSI sequence had a SPACE intermediate */
     int             trkEsc;
     LONG            trkN, trkN1;
     LONG            startCol;        /* column where the edited line begins */
@@ -303,6 +308,11 @@ static void con_write(struct Console *c, const unsigned char *p, LONG n)
         } else if (ch == 0x9b) {               /* Amiga CSI -> ANSI ESC [ */
             out_put(c, 27); out_put(c, '[');
             term_track(c, 27); term_track(c, '[');
+        } else if (ch == 12) {               /* FF: Amiga console clears and homes */
+            out_put(c, 27); out_put(c, '['); out_put(c, '2'); out_put(c, 'J');
+            out_put(c, 27); out_put(c, '['); out_put(c, 'H');
+            term_track(c, 27); term_track(c, '['); term_track(c, '2'); term_track(c, 'J');
+            term_track(c, 27); term_track(c, '['); term_track(c, 'H');
         } else if (ch == 10 && c->prevOut != 13) {
             out_put(c, 13); out_put(c, 10);    /* bare LF -> CRLF */
             term_track(c, 13); term_track(c, 10);
@@ -497,13 +507,42 @@ static unsigned char ready_get(struct Console *c)
 
 /* ---------------- client cursor tracking ------------------------------- */
 
-/* The column the client's cursor is in, followed through every byte we
- * send (program output and the editor's own), so the editor knows where
- * the prompt ended. termCol == cols means "wrap pending": the last column
- * was just written and the next printable character lands at the start of
- * the next row (VT100/xterm behaviour). Cursor movement in program output
- * is followed for the usual CSI sequences; anything exotic can leave this
- * off, which only affects the editor's drawing. */
+static void ready_put_dec(struct Console *c, LONG n)
+{
+    char d[8];
+    int i = 0;
+    if (n <= 0) { ready_put(c, '0'); return; }
+    while (n > 0 && i < (int)sizeof d) { d[i++] = (char)('0' + n % 10); n /= 10; }
+    while (i > 0) ready_put(c, (unsigned char)d[--i]);
+}
+
+/* A program wrote "window status request" (CSI 0 SPACE q): answer in its
+ * input with "window bounds report" CSI 1;1;<rows>;<cols> SPACE r, as
+ * CON: does. CSI is the Amiga byte 0x9B. */
+static void con_report_bounds(struct Console *c)
+{
+    ready_put(c, 0x9b);
+    ready_put(c, '1'); ready_put(c, ';');
+    ready_put(c, '1'); ready_put(c, ';');
+    ready_put_dec(c, c->rows); ready_put(c, ';');
+    ready_put_dec(c, c->cols);
+    ready_put(c, ' '); ready_put(c, 'r');
+}
+
+/* The cursor row/column the client terminal is in, followed through every
+ * byte we send (program output and the editor's own). termCol == cols means
+ * "wrap pending": the last column was just written and the next printable
+ * character lands at the start of the next row (VT100/xterm behaviour);
+ * then the row moves down too, clamped at the bottom (the screen scrolls).
+ * Cursor movement in program output is followed for the usual CSI
+ * sequences; anything exotic can leave this off, which only affects the
+ * editor's drawing and More's page counting. */
+static void row_down(struct Console *c, LONG n)
+{
+    c->termRow += n;
+    if (c->termRow > c->rows - 1) c->termRow = c->rows - 1;   /* the screen scrolls */
+}
+
 static void term_track(struct Console *c, unsigned char ch)
 {
     LONG n;
@@ -511,27 +550,58 @@ static void term_track(struct Console *c, unsigned char ch)
         c->trkEsc = (ch == '[') ? 2 : 0;
         c->trkN = 0;
         c->trkN1 = -1;
+        c->trkSpace = FALSE;
+        if (ch == 'c') { c->termCol = 0; c->termRow = 0; }   /* ESC c: full reset */
         return;
     }
     if (c->trkEsc == 2) {                     /* inside ESC [ */
         if (ch >= '0' && ch <= '9') { if (c->trkN < 10000) c->trkN = c->trkN * 10 + (ch - '0'); return; }
         if (ch == ';') { c->trkN1 = c->trkN; c->trkN = 0; return; }
+        if (ch == ' ') { c->trkSpace = TRUE; return; }
         if (ch < 0x40) return;                /* other parameter/intermediate bytes */
         c->trkEsc = 0;
-        if (ch != 'C' && ch != 'D' && ch != 'G' && ch != 'H' && ch != 'f') return;
+        if (ch == 'q' && c->trkSpace && c->trkN == 0 && c->trkN1 < 0) {
+            con_report_bounds(c);             /* CSI 0 SPACE q / CSI SPACE q */
+            return;
+        }
+        if (c->trkSpace) return;              /* other SPACE sequences: no movement */
         n = c->trkN ? c->trkN : 1;
         if (c->termCol >= c->cols) c->termCol = c->cols - 1;   /* movement ends a pending wrap */
-        if (ch == 'C')      c->termCol += n;
-        else if (ch == 'D') c->termCol -= n;
-        else if (ch == 'G') c->termCol = n - 1;
-        else                c->termCol = (c->trkN1 >= 0 && c->trkN > 0) ? c->trkN - 1 : 0;
+        switch (ch) {
+        case 'C': c->termCol += n; break;
+        case 'D': c->termCol -= n; break;
+        case 'G': c->termCol = n - 1; break;
+        case 'A': c->termRow -= n; break;
+        case 'B': c->termRow += n; break;
+        case 'E': c->termRow += n; c->termCol = 0; break;
+        case 'F': c->termRow -= n; c->termCol = 0; break;
+        case 'd': c->termRow = n - 1; break;
+        case 'H':
+        case 'f':
+            if (c->trkN1 >= 0) {              /* ESC [ row ; col H */
+                c->termRow = c->trkN1 > 0 ? c->trkN1 - 1 : 0;
+                c->termCol = c->trkN > 0 ? c->trkN - 1 : 0;
+            } else {                          /* ESC [ row H, ESC [ H */
+                c->termRow = c->trkN > 0 ? c->trkN - 1 : 0;
+                c->termCol = 0;
+            }
+            break;
+        default:
+            return;
+        }
         if (c->termCol < 0) c->termCol = 0;
         if (c->termCol > c->cols - 1) c->termCol = c->cols - 1;
+        if (c->termRow < 0) c->termRow = 0;
+        if (c->termRow > c->rows - 1) c->termRow = c->rows - 1;
         return;
     }
     if (ch == 27) { c->trkEsc = 1; return; }
     if (ch == 13) { c->termCol = 0; return; }
-    if (ch == 10) { if (c->termCol >= c->cols) c->termCol = c->cols - 1; return; }
+    if (ch == 10 || ch == 11 || ch == 12) {   /* LF, VT, FF: xterm moves down a line */
+        if (c->termCol >= c->cols) c->termCol = c->cols - 1;
+        row_down(c, 1);
+        return;
+    }
     if (ch == 8) {
         if (c->termCol >= c->cols) c->termCol = c->cols - 1;
         if (c->termCol > 0) c->termCol--;
@@ -544,7 +614,12 @@ static void term_track(struct Console *c, unsigned char ch)
         return;
     }
     if (ch < 32 || (ch >= 127 && ch < 160)) return;   /* other controls: no movement */
-    c->termCol = (c->termCol >= c->cols) ? 1 : c->termCol + 1;
+    if (c->termCol >= c->cols) {              /* wrap pending: this char starts the next row */
+        c->termCol = 1;
+        row_down(c, 1);
+    } else {
+        c->termCol++;
+    }
 }
 
 
@@ -904,6 +979,9 @@ struct Session {
 };
 
 static struct Session  *gSess[MAXSLOTS];
+static BOOL             gConWinWanted = FALSE;  /* CONWINDOW */
+static struct Window   *gConWin = NULL;         /* shared 1x1 window for More & co. */
+static BOOL             gConWinUsed = FALSE;    /* handed out at least once */
 static struct List      gRetired;         /* ports of ended sessions (mp_Node) */
 static LONG             gSessions = 0;    /* sessions started so far */
 static LONG             gMaxSessions = DEFSESSIONS;
@@ -959,6 +1037,8 @@ static void slog(struct Session *s, const char *fmt, LONG arg)
 struct HPort {
     struct MsgPort  mp;               /* first: used as a plain MsgPort */
     LONG            deadOpens;
+    struct IOStdReq io;               /* CONWINDOW: id_InUse; only io_Unit is read */
+    struct ConUnit  cu;               /* CONWINDOW: io.io_Unit points here */
 };
 
 /* A port on the shared signal: AllocSignal for every session would run
@@ -999,6 +1079,40 @@ static LONG dead_opens(void)
     for (n = gRetired.lh_Head; n->ln_Succ; n = n->ln_Succ)
         sum += ((struct HPort *)n)->deadOpens;
     return sum;
+}
+
+/* CONWINDOW: the real window behind id_VolumeNode. More (v3.27) only calls
+ * SetWindowTitles() on it; with no title bar nothing is drawn. A fake
+ * struct Window must never be used - Intuition would work on garbage. */
+static struct Window *conwin_get(void)
+{
+    struct NewWindow nw;
+    if (gConWin || !IntuitionBase) return gConWin;
+    memset(&nw, 0, sizeof nw);
+    nw.Width = 1;
+    nw.Height = 1;
+    nw.DetailPen = (UBYTE)-1;
+    nw.BlockPen = (UBYTE)-1;
+    nw.Flags = WFLG_BORDERLESS | WFLG_BACKDROP | WFLG_SIMPLE_REFRESH |
+               WFLG_NOCAREREFRESH | WFLG_RMBTRAP;
+    nw.Type = WBENCHSCREEN;
+    gConWin = OpenWindow(&nw);
+    logmsg(gConWin ? "telnetd: console window opened\n"
+                   : "telnetd: could not open the console window\n", 0);
+    return gConWin;
+}
+
+/* Keep the session's ConUnit in step with the client screen. More reads
+ * cu_YCP right after each Write() returns, so this must run before a WRITE
+ * is answered. */
+static void conunit_sync(struct Session *s)
+{
+    struct HPort *hp = (struct HPort *)s->port;
+    struct Console *c = &s->con;
+    hp->cu.cu_XMax = (WORD)(c->cols - 1);
+    hp->cu.cu_YMax = (WORD)(c->rows - 1);
+    hp->cu.cu_XCP  = (WORD)(c->termCol >= c->cols ? c->cols - 1 : c->termCol);
+    hp->cu.cu_YCP  = (WORD)c->termRow;
 }
 
 static void port_abandon(struct MsgPort *p)
@@ -1205,6 +1319,7 @@ static void service_writes(struct Session *s)
         if (pkt->dp_Res1 < pkt->dp_Arg3) return;      /* wait for the socket */
         ed_output_end(c);
         Remove(&msg->mn_Node);
+        conunit_sync(s);
         reply(pkt, pkt->dp_Arg3, 0);
     }
 }
@@ -1338,21 +1453,27 @@ static void handle_packet(struct Session *s, struct MsgPort *port, struct Messag
          * write 36 bytes at a quarter of the real address. */
         struct InfoData *id = (struct InfoData *)BADDR((BPTR)pkt->dp_Arg1);
         if (id) {
-            /* All NULL/zero is the documented safe answer for a console
-             * without a window: ID_VolumeNode would hold the Intuition
-             * Window pointer and ID_InUse the console io-request pointer
-             * (AmigaDOS_Packets wiki); tools NULL-check both (AUX: rule).
-             * A non-pointer value there (DOSTRUE!) is dereferenced by
-             * pagers such as More for screen dimensions -> 80000003.
-             *
-             * Hardware-tested (2026-10-08): handing More a synthetic
-             * Window (id_VolumeNode, pixel geometry from NAWS) or a
-             * synthetic io-request/ConUnit (id_InUse) makes it produce
-             * no output at all - More follows these pointers into real
-             * Intuition/console machinery it then uses. Only NULL is
-             * safe, and it means More pages at its 640x200/8 = 24-line
-             * default regardless of the client's real window size. */
+            /* Default: all NULL, the documented answer for a console
+             * without a window (AUX:); programs then use defaults (More:
+             * 80x24). With CONWINDOW a live session answers like CON::
+             * id_VolumeNode = a real window, id_InUse = an IOStdReq whose
+             * io_Unit is a ConUnit kept in step with the client screen
+             * (cu_XMax/cu_YMax from NAWS, cu_XCP/cu_YCP from the tracked
+             * cursor). More v3.27 reads only those four ConUnit fields and
+             * calls SetWindowTitles() on the window - nothing else. Both
+             * are plain C pointers, as CON: stores them. */
             memset(id, 0, sizeof *id);
+            if (s && !s->con.hangup && gConWinWanted && conwin_get()) {
+                struct HPort *hp = (struct HPort *)port;
+                SetWindowTitles(gConWin, NULL, (UBYTE *)~0);   /* drop stale titles */
+                conunit_sync(s);
+                hp->cu.cu_Window = gConWin;
+                hp->io.io_Unit = (struct Unit *)&hp->cu;
+                id->id_VolumeNode = (BPTR)(ULONG)gConWin;
+                id->id_InUse = (LONG)&hp->io;
+                gConWinUsed = TRUE;
+                slog(s, "disk_info: console window, %ld rows\n", s->con.rows);
+            }
         }
         reply(pkt, DOSTRUE, 0);
         break;
@@ -1590,6 +1711,7 @@ static void session_step(int i)
     service_writes(s);
     flush_out(s);
     if (!s->closingAt) pump_input(c);
+    conunit_sync(s);
     service_reads(s);
     flush_out(s);
 
@@ -1617,7 +1739,7 @@ static void session_step(int i)
 
 int main(int argc, char **argv)
 {
-    LONG args[5] = { 0, 0, 0, 0, 0 };
+    LONG args[6] = { 0, 0, 0, 0, 0, 0 };
     struct RDArgs *rd;
     struct sockaddr_in sa;
     struct Process *self = (struct Process *)FindTask(NULL);
@@ -1637,9 +1759,9 @@ int main(int argc, char **argv)
         return RETURN_FAIL;
     }
 
-    rd = ReadArgs((STRPTR)"PORT/N,LOG/K,DUMBTERM/S,MAXSESSIONS/K/N,SHELLSTACK/K/N", args, NULL);
+    rd = ReadArgs((STRPTR)"PORT/N,LOG/K,DUMBTERM/S,MAXSESSIONS/K/N,SHELLSTACK/K/N,CONWINDOW/S", args, NULL);
     if (rd == NULL) {
-        PutStr((STRPTR)"usage: telnetd [PORT <n>] [LOG <file>] [DUMBTERM] [MAXSESSIONS <n>] [SHELLSTACK <bytes>]\n");
+        PutStr((STRPTR)"usage: telnetd [PORT <n>] [LOG <file>] [DUMBTERM] [MAXSESSIONS <n>] [SHELLSTACK <bytes>] [CONWINDOW]\n");
         return RETURN_FAIL;
     }
     if (args[0]) port = *(ULONG *)args[0];
@@ -1653,6 +1775,11 @@ int main(int argc, char **argv)
     if (args[4]) {
         gShellStack = *(LONG *)args[4];
         if (gShellStack < 4000) gShellStack = 4000;
+    }
+    if (args[5]) {                            /* CONWINDOW */
+        IntuitionBase = (struct IntuitionBase *)OpenLibrary((STRPTR)"intuition.library", 36);
+        if (IntuitionBase) gConWinWanted = TRUE;
+        else PutStr((STRPTR)"telnetd: no intuition.library - CONWINDOW off\n");
     }
     if (gLogName) {                          /* fresh trace per run */
         BPTR f = Open(gLogName, MODE_NEWFILE);
@@ -1793,8 +1920,24 @@ out:
         FreeVec(s);
         gSess[i] = NULL;
     }
-    while (!IsListEmpty(&gRetired))
-        port_abandon((struct MsgPort *)RemHead(&gRetired));
+    {
+        /* The shared window may still be in use by a More whose shell
+         * ignored the hangup: its handles are counted on the retired ports
+         * (dead_opens). Close it only when nothing can still hold it;
+         * otherwise leave it (and intuition.library) open - More calls
+         * SetWindowTitles() on it when it exits. */
+        BOOL conWinFree = !gConWinUsed || dead_opens() == 0;
+        while (!IsListEmpty(&gRetired))
+            port_abandon((struct MsgPort *)RemHead(&gRetired));
+        if (gConWin) {
+            SetWindowTitles(gConWin, NULL, (UBYTE *)~0);
+            if (conWinFree) {
+                CloseWindow(gConWin);
+                gConWin = NULL;
+            }
+        }
+        if (IntuitionBase && !gConWin) CloseLibrary((struct Library *)IntuitionBase);
+    }
 
     if (SocketBase) CloseLibrary(SocketBase);
     self->pr_WindowPtr = oldwinptr;
