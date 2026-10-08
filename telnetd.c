@@ -1447,7 +1447,7 @@ static void handle_packet(struct Session *s, struct MsgPort *port, struct Messag
         reply(pkt, -1, ERROR_OBJECT_WRONG_TYPE);
         break;
 
-    case ACTION_DISK_INFO: {                /* more and friends probe the console */
+    case ACTION_DISK_INFO: {                /* size-aware tools such as More probe the console */
         /* dp_Arg1 is a BPTR (dos Packets doc: "ARG1: BPTR to InfoData"),
          * like every DOS struct argument: used as a C pointer it would
          * write 36 bytes at a quarter of the real address. */

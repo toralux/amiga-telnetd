@@ -21,7 +21,7 @@ only. See docs/DESIGN.md for the full architecture and provenance.
 1> telnetd MAXSESSIONS=2       ; at most 2 sessions at once (1-8, default 4)
 1> telnetd SHELLSTACK=40000    ; stack for commands in the sessions (default 20000)
 1> telnetd LOG=T:tdbg.log      ; also write a crash-surviving trace (any path)
-1> telnetd NOCONWINDOW         ; More and friends page at a fixed 24 lines (old behaviour)
+1> telnetd NOCONWINDOW         ; More pages at a fixed 24 lines (old behaviour)
 1> telnetd DUMBTERM            ; for clients without ANSI support (see below)
 ```
 
