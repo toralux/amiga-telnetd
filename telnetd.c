@@ -206,6 +206,7 @@ struct Console {
     /* Bytes for the client, exactly as they go on the wire. */
     unsigned char   out[OUTSZ];
     LONG            oHead, oCount;
+    LONG            dropped;         /* bytes lost to a full buffer (must stay 0) */
     unsigned char   prevOut;         /* last program byte, for LF -> CRLF */
 
     /* Cooked-mode line editor with history. On a real Amiga this is CON:'s
@@ -257,17 +258,25 @@ static LONG out_room(struct Console *c)
     return OUTSZ - c->oCount;
 }
 
+/* Never full in practice: program output stops ED_RESERVE short of the
+ * end, the editor only runs with ED_RESERVE free and writes far less per
+ * key, and option replies never touch the reserve (send_opt). */
 static void out_put(struct Console *c, unsigned char b)
 {
-    if (c->oCount < OUTSZ) {             /* full only if a client floods options */
+    if (c->oCount < OUTSZ) {
         c->out[(c->oHead + c->oCount) & (OUTSZ - 1)] = b;
         c->oCount++;
+    } else {
+        c->dropped++;
     }
 }
 
+/* Option replies are skipped, whole, rather than eat into the editor's
+ * reserve - only a client flooding requests while output is backed up
+ * can get here, and it loses replies, never parts of other output. */
 static void send_opt(struct Console *c, int cmd, int opt)
 {
-    if (out_room(c) < 3) return;
+    if (out_room(c) < ED_RESERVE + 3) return;
     out_put(c, TEL_IAC);
     out_put(c, (unsigned char)cmd);
     out_put(c, (unsigned char)opt);

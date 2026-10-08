@@ -137,7 +137,9 @@ static char cell(long lin) { return scr[lin / W][lin % W]; }
 static void check(const char *ctx)
 {
     long off, startLin, i, endLin;
+    if (c->dropped) { printf("[%s] ", ctx); fail("output bytes dropped"); }
     if (c->esc != 0 || !c->will[OPT_ECHO] || !c->edit || c->raw) return;
+    if (c->writing) return;           /* line is off screen while output is written */
     if (c->len == 0) return;          /* empty line: anchored at the next key, after the prompt */
     if (pend) { printf("[%s] ", ctx); fail("left in wrap-pending state"); }
     off = c->startCol + c->cur;
@@ -185,6 +187,11 @@ static void show_prompt(void) { program_output(prompt); promptKnown = 1; }
 
 static void keys(const char *s, int n)
 {
+    char ctx[24];                             /* printable copy for messages */
+    int k;
+    for (k = 0; k < n && k < (int)sizeof ctx - 1; k++)
+        ctx[k] = (s[k] >= 32 && s[k] < 127) ? s[k] : '.';
+    ctx[k] = 0;
     memcpy(feed + feedLen, s, (size_t)n);
     feedLen += n;
     while (feedPos < feedLen || c->inHead < c->inTail) {
@@ -192,7 +199,7 @@ static void keys(const char *s, int n)
         LONG ih = c->inHead;
         pump_input(c);
         drain();
-        check(s);
+        check(ctx);
         if (feedPos == fp && c->inHead == ih) break;   /* console takes no more now */
     }
 }
@@ -344,6 +351,27 @@ int main(void)
     /* DUMBTERM: client-edited lines collected, no echo, BS honoured */
     fresh(80, "> "); c->edit = FALSE; c->will[OPT_ECHO] = FALSE;
     KEYS("ab\bc\r"); { char g[64]; take_line(g); if (strcmp(g, "ac\n")) fail("DUMBTERM line"); }
+
+    /* a client flooding option requests while output is backed up cannot
+     * eat the editor's reserve: no byte is ever dropped, the screen still
+     * matches the line, and the typed line survives */
+    fresh(40, "> ");
+    type_n('L', 200);                         /* redraw after the output needs ~210 bytes */
+    { static unsigned char big[OUTSZ]; static char flood[3 * 600]; int k;
+      memset(big, 'o', sizeof big);
+      c->writing = TRUE;
+      ed_output_begin(c);
+      con_write(c, big, (OUTSZ - ED_RESERVE) - 16);   /* as full as service_writes gets it */
+      for (k = 0; k < 600; k++) { flood[3*k] = (char)255; flood[3*k+1] = (char)253; flood[3*k+2] = (char)(40 + k % 50); }
+      /* DO <opt> x 600, read while writing; nothing is sent meanwhile
+       * (the client is not taking output), so the buffer stays backed up */
+      memcpy(feed + feedLen, flood, sizeof flood); feedLen += (int)sizeof flood;
+      pump_input(c);
+      ed_output_end(c);
+      if (c->dropped != 0) fail("output bytes dropped under an option flood");
+      drain(); promptKnown = 0; check("after option flood");
+      pump_input(c); drain(); check("after option flood, held keys");
+      KEYS("\030"); }
 
     /* hangup */
     fresh(80, "> "); hung = 1; pump_input(c); if (!c->hangup) fail("hangup");
