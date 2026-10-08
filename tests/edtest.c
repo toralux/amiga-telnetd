@@ -441,6 +441,23 @@ int main(void)
     if (c->termRow != 0 || c->termCol != 0) fail("FF homes the cursor");
     c->oCount = 0;
 
+    /* con_fit: program output never takes more than the room it is given */
+    srand(777);
+    for (t = 0; t < 2000; t++) {
+        static const unsigned char pick[] = { 'a', 10, 13, 12, 255, 0x9b };
+        static unsigned char buf[3000];
+        LONG n = 1 + rand() % (LONG)sizeof buf, room = rand() % 3000, before, fit, j;
+        for (j = 0; j < n; j++)
+            buf[j] = (t & 1) ? 12 : pick[rand() % (int)sizeof pick];
+        c->oCount = 0; before = c->oCount;
+        fit = con_fit(c, buf, n, room);
+        con_write(c, buf, fit);
+        if (c->oCount - before > room) fail("con_fit overran its room");
+        if (fit < n && c->oCount - before + 7 <= room) fail("con_fit stopped early");
+        c->rCount = 0; c->rHead = 0;
+    }
+    c->oCount = 0;
+
     /* fuzz: random keys and program output at random widths and prompts */
     srand(12345);
     for (t = 0; t < 60000; t++) {

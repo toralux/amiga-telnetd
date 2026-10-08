@@ -324,6 +324,23 @@ static void con_write(struct Console *c, const unsigned char *p, LONG n)
     }
 }
 
+/* How many of n program bytes con_write can take without producing more
+ * than room bytes: FF becomes seven, IAC, CSI and a bare LF become two. */
+static LONG con_fit(const struct Console *c, const unsigned char *p, LONG n, LONG room)
+{
+    unsigned char prev = c->prevOut;
+    LONG i;
+    for (i = 0; i < n; i++) {
+        unsigned char ch = p[i];
+        LONG w = ch == 12 ? 7
+               : (ch == 255 || ch == 0x9b || (ch == 10 && prev != 13)) ? 2 : 1;
+        if (w > room) break;
+        room -= w;
+        prev = ch;
+    }
+    return i;
+}
+
 
 /* ---------------- telnet option handling ------------------------------- */
 
@@ -1308,12 +1325,12 @@ static void service_writes(struct Session *s)
     struct Message *msg;
     while ((msg = (struct Message *)s->writeWait.lh_Head)->mn_Node.ln_Succ) {
         struct DosPacket *pkt = pkt_of(msg);
-        LONG left = pkt->dp_Arg3 - pkt->dp_Res1;
-        LONG room = (out_room(c) - ED_RESERVE) / 2;   /* each byte can become two */
+        const unsigned char *src = (const unsigned char *)pkt->dp_Arg2 + pkt->dp_Res1;
+        LONG left;
         if (!c->writing) ed_output_begin(c);
-        if (left > room) left = room;
+        left = con_fit(c, src, pkt->dp_Arg3 - pkt->dp_Res1, out_room(c) - ED_RESERVE);
         if (left > 0) {
-            con_write(c, (const unsigned char *)pkt->dp_Arg2 + pkt->dp_Res1, left);
+            con_write(c, src, left);
             pkt->dp_Res1 += left;
         }
         if (pkt->dp_Res1 < pkt->dp_Arg3) return;      /* wait for the socket */
