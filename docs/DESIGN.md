@@ -96,7 +96,9 @@ Red herrings from the earlier investigation:
    port, `fh_Port` non-zero (interactive), `fh_Pos = fh_End = -1`. A
    short-lived helper process copies them, signals the daemon (so the next
    session cannot overwrite them first), runs `SystemTags("NewShell *",
-   SYS_Input=in, SYS_Output=out, NP_ConsoleTask=port, NP_Cli)` synchronously,
+   SYS_Input=in, SYS_Output=out, NP_ConsoleTask=port, NP_Cli,
+   NP_StackSize=SHELLSTACK)` synchronously (the helper has no CLI, so without
+   NP_StackSize the session shell's command stack would be the DOS default),
    then `Forbid(); Close(); Close()` as telnetd 2.0 does (synchronous System()
    does not close them). `SystemTags(SYS_Asynch)` from the daemon itself hung
    on hardware: the daemon is the handler of those handles. NewShell opens
@@ -105,8 +107,11 @@ Red herrings from the earlier investigation:
    buffer and is sent as the socket takes it. A WRITE is copied in chunks,
    keeping 1 KB free for the line editor, and answered only when all of it is
    queued - a slow client blocks only its own shell. A client that takes
-   nothing for 60 s is hung up. While a WRITE is half queued no input is
-   taken, so typed keys are never echoed into the middle of output.
+   nothing for 60 s is hung up. While a WRITE is half queued (or the shell is
+   not reading) the socket is still read: keys go into a 256-byte held buffer
+   and are edited and echoed once the editor can take them, so typed keys
+   never land in the middle of output, while Ctrl-C, telnet "interrupt
+   process" and a disconnect take effect at once.
 7. **Console.** In cooked mode the daemon is the line editor (echo, cursor
    keys, 16-line history), as CON: is on a real Amiga; raw mode passes keys
    through. The editor learns the window width with telnet NAWS and follows
@@ -116,14 +121,18 @@ Red herrings from the earlier investigation:
    line mode).
 8. **Session end.** When every handle on the port is closed (only after
    NewShell has opened `*`), the remaining output is sent (up to 5 s), the
-   socket closed and the port retired.
+   socket closed and the port retired. A FIND arriving meanwhile (a `run`
+   job opening `*`) puts the session back in use. Handles opened on a retired
+   port are counted on the port, and a port is only reused once they are
+   closed, so their ENDs can never be taken off a later session's count.
 9. **Hangup or Ctrl-C.** Signal Ctrl-C to the reading process, answer every
    queued and future READ with break (0 bytes, `ERROR_BREAK`) so the shell
    ends by itself, close the socket. A shell that has not ended after 3 s is
    left detached: its session stays until its handles close, without
    counting against `MAXSESSIONS`. Ctrl-C to the daemon hangs up every session
-   and waits (still serving packets) for them and for every spawn helper,
-   which runs code in the daemon's seglist, up to 3 s.
+   and waits (still serving packets) up to 3 s for them, and with no time
+   limit for every spawn helper: helpers run code in the daemon's seglist,
+   which must not be unloaded under them.
 10. **Exit.** Ports still in use and retired ports are left allocated with
     `PA_IGNORE`: a process that still has one as console task then blocks on
     a late packet instead of writing into freed memory.

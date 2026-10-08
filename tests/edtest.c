@@ -188,10 +188,12 @@ static void keys(const char *s, int n)
     memcpy(feed + feedLen, s, (size_t)n);
     feedLen += n;
     while (feedPos < feedLen || c->inHead < c->inTail) {
+        int fp = feedPos;
+        LONG ih = c->inHead;
         pump_input(c);
         drain();
         check(s);
-        if (ready_room(c) <= LINEMAX + 1) break;
+        if (feedPos == fp && c->inHead == ih) break;   /* console takes no more now */
     }
 }
 #define KEYS(s) keys(s, (int)sizeof(s) - 1)
@@ -354,11 +356,29 @@ int main(void)
       con_write(c, (const unsigned char *)"\r", 1); con_write(c, (const unsigned char *)"\n", 1);
       if (c->oCount - before != 2) fail("CR + LF across writes doubled");
       drain(); }
-    c->writing = TRUE; if (con_wants_input(c)) fail("input taken during a WRITE"); c->writing = FALSE;
+    /* during a WRITE keys are read but held (no echo into the output);
+     * Ctrl-C acts at once; the held keys are edited when the WRITE ends */
+    c->writing = TRUE;
+    if (con_can_edit(c)) fail("editing during a WRITE");
+    if (!con_wants_input(c)) fail("socket not read during a WRITE");
+    sigs = 0;
+    KEYS("ab\003cd");
+    if (!(sigs & SIGBREAKF_CTRL_C)) fail("Ctrl-C held back during a WRITE");
+    if (c->hCount != 4 || c->len != 0) fail("keys not held during a WRITE");
+    c->writing = FALSE;
+    KEYS("\r");
+    expect("abcd\n");
+    /* held buffer full: the socket is left alone */
+    c->writing = TRUE;
+    { int k; for (k = 0; k < HELDSZ + 10; k++) KEYS("z"); }
+    if (c->hCount != HELDSZ || con_wants_input(c)) fail("held buffer limit");
+    c->writing = FALSE; feedLen = feedPos = 0; c->inHead = c->inTail = 0;
+    pump_input(c); drain();
+    KEYS("\030");
     { static unsigned char big[OUTSZ]; memset(big, 'o', sizeof big);
       con_write(c, big, OUTSZ - ED_RESERVE + 1);
-      if (con_wants_input(c)) fail("input taken without editor reserve");
-      drain(); if (!con_wants_input(c)) fail("input refused with room"); }
+      if (con_can_edit(c)) fail("editing without editor reserve");
+      drain(); if (!con_can_edit(c)) fail("editing refused with room"); }
 
     /* fuzz: random keys and program output at random widths and prompts */
     srand(12345);

@@ -57,6 +57,7 @@
  *       1> telnetd MAXSESSIONS=2           ; fewer (or more, up to 8)
  *       1> telnetd LOG=T:tdbg.log          ; crash-surviving trace (any path)
  *       1> telnetd DUMBTERM                ; clients without ANSI support
+ *       1> telnetd SHELLSTACK=40000        ; stack for commands in sessions
  * Stop with Ctrl-C in the starting Shell.
  *
  * WARNING: no authentication. LAN use only — never expose to the internet.
@@ -106,19 +107,6 @@
 #ifndef ACTION_DISK_INFO
 #define ACTION_DISK_INFO 25              /* wiki.amigaos.net: AmigaDOS_Packets */
 #endif
-
-/* Console-flavoured InfoData for ACTION_DISK_INFO (frozen ABI: 9 LONGs). */
-struct td_InfoData {
-    LONG id_NumSoftErrors;
-    LONG id_UnitNumber;
-    LONG id_DiskState;
-    LONG id_NumBlocks;
-    LONG id_NumBlocksUsed;
-    LONG id_BytesPerBlock;
-    LONG id_DiskType;
-    LONG id_VolumeNode;
-    LONG id_InUse;
-};
 
 static const char __attribute__((used)) verstag[] =
     "$VER: telnetd 0.5 (8.10.2026)";
@@ -181,6 +169,8 @@ static void logmsg(const char *fmt, LONG arg)
 #define READYSZ      1024             /* power of two */
 #define OUTSZ        4096             /* power of two */
 #define ED_RESERVE   1024             /* output room kept for the editor and replies */
+#define HELDSZ       256              /* keys read while they cannot be edited yet */
+#define HELD_ROOM    64               /* output room needed to read at all (option replies) */
 #define LINEMAX      255
 #define HISTN        16               /* power of two */
 
@@ -207,6 +197,8 @@ struct Console {
     /* Input that is ready for READ: whole edited lines in cooked mode, raw
      * bytes in raw mode. The socket is drained into it whether or not a
      * READ is waiting, so typeahead is echoed and a disconnect seen. */
+    unsigned char   held[HELDSZ];    /* decoded keys waiting for the editor */
+    LONG            hHead, hCount;
     unsigned char   ready[READYSZ];
     LONG            rHead, rCount;
     BOOL            eof;             /* Ctrl-\ on an empty line */
@@ -820,25 +812,57 @@ static void plain_key(struct Console *c, unsigned char ch)
  * ready queue, room for the editor's output, and no program output half
  * written. Otherwise the socket is not selected (readable data nobody
  * consumes would make WaitSelect return at once, forever). */
-static BOOL con_wants_input(struct Console *c)
+/* Whether the editor (or raw/DUMBTERM input) can take keys now: room for
+ * a whole line in the ready queue, room for the editor's output, and no
+ * program output half written (no echo into the middle of output). */
+static BOOL con_can_edit(struct Console *c)
 {
-    return !c->hangup && !c->writing &&
-           ready_room(c) > LINEMAX + 1 && out_room(c) >= ED_RESERVE;
+    return !c->writing && ready_room(c) > LINEMAX + 1 && out_room(c) >= ED_RESERVE;
 }
 
-/* Move socket input into the ready queue (through the line editor in
- * cooked mode), as long as con_wants_input() holds. */
+/* Whether the socket should be read now. Even when the editor cannot take
+ * keys, the socket is read into the held buffer, so Ctrl-C, telnet
+ * "interrupt process" and a disconnect are seen at once - during long
+ * output, or while a command runs without reading. Only when that buffer
+ * is full is the socket left alone (readable data nobody consumes would
+ * make WaitSelect return at once, forever). */
+static BOOL con_wants_input(struct Console *c)
+{
+    if (c->hangup) return FALSE;
+    if (c->hCount == 0 && con_can_edit(c)) return TRUE;
+    return c->hCount < HELDSZ && out_room(c) >= HELD_ROOM;
+}
+
+static void con_key(struct Console *c, unsigned char ch)
+{
+    if (c->raw)       ready_put(c, ch);
+    else if (c->edit) ed_key(c, ch);
+    else              plain_key(c, ch);
+}
+
+/* Move input on: held keys first, in order, then the socket - straight to
+ * the editor when it can take keys, into the held buffer otherwise. Break
+ * keys act inside next_char(), whichever way the key then goes. */
 static void pump_input(struct Console *c)
 {
     unsigned char ch;
     LONG r;
+    while (c->hCount > 0 && con_can_edit(c)) {
+        ch = c->held[c->hHead];
+        c->hHead = (c->hHead + 1) & (HELDSZ - 1);
+        c->hCount--;
+        con_key(c, ch);
+    }
     while (con_wants_input(c)) {
         r = next_char(c, &ch);
         if (r == 0) { do_hangup(c); return; }
         if (r < 0) return;
-        if (c->raw)       ready_put(c, ch);
-        else if (c->edit) ed_key(c, ch);
-        else              plain_key(c, ch);
+        if (c->hCount == 0 && con_can_edit(c)) {
+            con_key(c, ch);
+        } else {
+            c->held[(c->hHead + c->hCount) & (HELDSZ - 1)] = ch;
+            c->hCount++;
+        }
     }
 }
 
@@ -911,12 +935,21 @@ static void slog(struct Session *s, const char *fmt, LONG arg)
 
 /* ---------------- handler ports ---------------------------------------- */
 
+/* A handler port plus the handles opened on it while it was retired
+ * (FIND with no session): those are never counted by a session, so the
+ * port is not reused until they are closed again - otherwise their END
+ * would be taken off the next session's count. */
+struct HPort {
+    struct MsgPort  mp;               /* first: used as a plain MsgPort */
+    LONG            deadOpens;
+};
+
 /* A port on the shared signal: AllocSignal for every session would run
  * out of the 16 user signals. */
 static struct MsgPort *port_new(void)
 {
     struct MsgPort *p;
-    p = (struct MsgPort *)AllocMem(sizeof(struct MsgPort), MEMF_PUBLIC | MEMF_CLEAR);
+    p = (struct MsgPort *)AllocMem(sizeof(struct HPort), MEMF_PUBLIC | MEMF_CLEAR);
     if (!p) return NULL;
     p->mp_Node.ln_Type = NT_MSGPORT;
     p->mp_Flags = PA_SIGNAL;
@@ -926,10 +959,17 @@ static struct MsgPort *port_new(void)
     return p;
 }
 
+/* The longest-retired port with no dead handles, or a new one. */
 static struct MsgPort *port_get(void)
 {
-    struct MsgPort *p = (struct MsgPort *)RemHead(&gRetired);
-    return p ? p : port_new();
+    struct Node *n;
+    for (n = gRetired.lh_Head; n->ln_Succ; n = n->ln_Succ) {
+        if (((struct HPort *)n)->deadOpens <= 0) {
+            Remove(n);
+            return (struct MsgPort *)n;
+        }
+    }
+    return port_new();
 }
 
 /* Exit with processes possibly still holding a port as console task:
@@ -1199,7 +1239,10 @@ static void handle_packet(struct Session *s, struct MsgPort *port, struct Messag
         if (s) {
             s->opens++;
             s->sawOpen = TRUE;
+            s->closingAt = 0;                  /* the session is in use again */
             slog(s, "find, opens %ld\n", s->opens);
+        } else {
+            ((struct HPort *)port)->deadOpens++;
         }
         reply(pkt, DOSTRUE, 0);
         break;
@@ -1254,6 +1297,8 @@ static void handle_packet(struct Session *s, struct MsgPort *port, struct Messag
         if (s) {
             s->opens--;
             slog(s, "END, %ld handles left\n", s->opens);
+        } else if (((struct HPort *)port)->deadOpens > 0) {
+            ((struct HPort *)port)->deadOpens--;
         }
         break;
 
@@ -1265,7 +1310,7 @@ static void handle_packet(struct Session *s, struct MsgPort *port, struct Messag
         /* dp_Arg1 is a BPTR (dos Packets doc: "ARG1: BPTR to InfoData"),
          * like every DOS struct argument: used as a C pointer it would
          * write 36 bytes at a quarter of the real address. */
-        struct td_InfoData *id = (struct td_InfoData *)BADDR((BPTR)pkt->dp_Arg1);
+        struct InfoData *id = (struct InfoData *)BADDR((BPTR)pkt->dp_Arg1);
         if (id) {
             memset(id, 0, sizeof *id);
             id->id_DiskType = ID_NO_DISK_PRESENT;
@@ -1319,23 +1364,28 @@ static struct Task     *gDaemonTask = NULL;
 static ULONG            gSpawnMask = 0;
 static volatile LONG    gHelpers = 0;      /* helpers that may still run our code */
 
+static LONG             gShellStack = 20000;   /* SHELLSTACK */
+
+/* Uses the daemon's DOSBase, which stays open until the daemon has seen
+ * every helper finish (gHelpers), so there is no failure path that could
+ * skip closing the handles or the gHelpers count. */
 static int spawner_entry(void)
 {
-    struct Library *dosBase;
     BPTR in = gSpawn.in, out = gSpawn.out;
     struct MsgPort *port = gSpawn.port;
     LONG rc;
 
     Signal(gDaemonTask, gSpawnMask);           /* gSpawn may be reused now */
 
-    dosBase = OpenLibrary((STRPTR)"dos.library", 36);
-    if (!dosBase) return RETURN_FAIL;
-
+    /* NP_StackSize: a CLI made here would otherwise get the DOS default
+     * (about 4 KB) as the stack for every command typed in the session -
+     * this helper has no CLI to inherit `stack` from. */
     rc = SystemTags((STRPTR)"NewShell *",
                     SYS_Input,      in,
                     SYS_Output,     out,
                     NP_ConsoleTask, (LONG)port,
                     NP_Cli,         TRUE,
+                    NP_StackSize,   gShellStack,
                     TAG_DONE);
     /* NewShell starts the interactive shell as a NEW process and returns
      * at once, so this returns long before the session ends. A synchronous
@@ -1350,7 +1400,6 @@ static int spawner_entry(void)
      * Forbid); after it returns we are Forbid()den again until the process
      * is gone. */
     logmsg("telnetd: helper rc %ld\n", rc);
-    CloseLibrary(dosBase);
     Forbid();
     Close(in);
     Close(out);
@@ -1484,8 +1533,8 @@ static void session_start(int sock)
 }
 
 /* One pass over a session after WaitSelect: output, input, reads, and the
- * lifecycle checks. Returns FALSE when the session has been freed. */
-static BOOL session_step(int i)
+ * lifecycle checks; may free the session (gSess[i] becomes NULL). */
+static void session_step(int i)
 {
     struct Session *s = gSess[i];
     struct Console *c = &s->con;
@@ -1508,14 +1557,13 @@ static BOOL session_step(int i)
     if (s->closingAt && s->opens <= 0 &&
         (c->sock < 0 || c->oCount == 0 || now - s->closingAt > CLOSE_SECS)) {
         session_free(i);
-        return FALSE;
+        return;
     }
     if (c->hangup && !s->detached && s->opens > 0 && now - s->hangupAt > DRAIN_SECS) {
         s->detached = TRUE;
         slog(s, "shell did not exit - left detached, %ld handles\n", s->opens);
         PutStr((STRPTR)"telnetd: a shell did not exit - left detached\n");
     }
-    return TRUE;
 }
 
 
@@ -1523,7 +1571,7 @@ static BOOL session_step(int i)
 
 int main(int argc, char **argv)
 {
-    LONG args[4] = { 0, 0, 0, 0 };
+    LONG args[5] = { 0, 0, 0, 0, 0 };
     struct RDArgs *rd;
     struct sockaddr_in sa;
     struct Process *self = (struct Process *)FindTask(NULL);
@@ -1532,6 +1580,7 @@ int main(int argc, char **argv)
     int one = 1, i;
     BYTE spawnSig = -1;
     LONG breakAt = 0;
+    BOOL helperNote = FALSE;
     APTR oldwinptr = self->pr_WindowPtr;
 
     (void)argc; (void)argv;
@@ -1542,9 +1591,9 @@ int main(int argc, char **argv)
         return RETURN_FAIL;
     }
 
-    rd = ReadArgs((STRPTR)"PORT/N,LOG/K,DUMBTERM/S,MAXSESSIONS/K/N", args, NULL);
+    rd = ReadArgs((STRPTR)"PORT/N,LOG/K,DUMBTERM/S,MAXSESSIONS/K/N,SHELLSTACK/K/N", args, NULL);
     if (rd == NULL) {
-        PutStr((STRPTR)"usage: telnetd [PORT <n>] [LOG <file>] [DUMBTERM] [MAXSESSIONS <n>]\n");
+        PutStr((STRPTR)"usage: telnetd [PORT <n>] [LOG <file>] [DUMBTERM] [MAXSESSIONS <n>] [SHELLSTACK <bytes>]\n");
         return RETURN_FAIL;
     }
     if (args[0]) port = *(ULONG *)args[0];
@@ -1554,6 +1603,10 @@ int main(int argc, char **argv)
         gMaxSessions = *(LONG *)args[3];
         if (gMaxSessions < 1) gMaxSessions = 1;
         if (gMaxSessions > MAXSESSIONS_LIMIT) gMaxSessions = MAXSESSIONS_LIMIT;
+    }
+    if (args[4]) {
+        gShellStack = *(LONG *)args[4];
+        if (gShellStack < 4000) gShellStack = 4000;
     }
     if (gLogName) {                          /* fresh trace per run */
         BPTR f = Open(gLogName, MODE_NEWFILE);
@@ -1631,9 +1684,14 @@ int main(int argc, char **argv)
             if (s->con.oCount > 0) FD_SET(s->con.sock, &wr);
             if (s->con.sock > maxfd) maxfd = s->con.sock;
         }
-        /* Stopping: wait (serving packets) until the sessions are gone
-         * and no helper can still return into this program's code. */
-        if (gBreak && ((!any && gHelpers == 0) || now_secs() - breakAt > DRAIN_SECS)) break;
+        /* Stopping: wait (serving packets) until the sessions are gone or
+         * given up on - and, without any time limit, until no spawn helper
+         * can still return into this program's code. */
+        if (gBreak && gHelpers == 0 && (!any || now_secs() - breakAt > DRAIN_SECS)) break;
+        if (gBreak && gHelpers > 0 && !helperNote && now_secs() - breakAt > DRAIN_SECS) {
+            PutStr((STRPTR)"telnetd: waiting for a shell to finish starting\n");
+            helperNote = TRUE;
+        }
 
         tv.tv_secs = 1;
         tv.tv_micro = 0;
