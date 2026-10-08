@@ -45,5 +45,9 @@ jobs:
             echo "release exists - refreshing assets instead of failing"
             gh release upload "$TAG" telnetd telnetd.020 README.md LICENSE --clobber
           else
-            gh release create "$TAG" --title "telnetd ${GITHUB_REF_NAME#v}" --generate-notes $FLAGS telnetd telnetd.020 README.md LICENSE
+            NOTES="--generate-notes"
+            if [ -f "docs/relnotes/$TAG.md" ]; then
+              NOTES="--notes-file docs/relnotes/$TAG.md"
+            fi
+            gh release create "$TAG" --title "telnetd ${GITHUB_REF_NAME#v}" $NOTES $FLAGS telnetd telnetd.020 README.md LICENSE
           fi
